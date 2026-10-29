@@ -38,7 +38,7 @@ class AndroidStorage:
 
     def _report_error(self, title, exc):
         message = str(exc).strip() or "Android storage operation failed."
-        self.app_ref.set_status("File access failed", (0.94, 0.27, 0.27, 1))
+        self.app_ref.set_status("File access failed", "#ef4444")
         self.app_ref.show_dialog(title, message[:1200])
 
     def _launch(self, intent, request):
@@ -201,7 +201,7 @@ class AndroidStorage:
                 document_uri, os.path.join(local_dir, self._safe_name(name)))
             copied += 1
         if copied == 0:
-            self.app_ref.set_status("Selected folder is empty", (0.96, 0.62, 0.05, 1))
+            self.app_ref.set_status("Selected folder is empty", "#f59e0b")
 
     def _copy_uri_to_path(self, uri, path):
         stream = self.resolver.openInputStream(uri)
@@ -271,8 +271,11 @@ class AndroidStorage:
             for name in os.listdir(local_directory)
             if os.path.isfile(os.path.join(local_directory, name))
         )
+        # An empty output folder is valid when the operation produced no
+        # files (for example, all TXD conversions failed). Let the caller show
+        # its more specific conversion errors instead of masking them here.
         if not files:
-            raise RuntimeError("The operation produced no files to export.")
+            return 0
         for path in files:
             self._write_file_to_tree(tree_uri, path)
         return len(files)
