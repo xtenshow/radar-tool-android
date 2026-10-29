@@ -1147,8 +1147,8 @@ class RadarApp(MDApp):
     def build(self):
         self.title = "GTA SA Radar Tool"
         self.theme_cls.theme_style = "Dark"
-        self.theme_cls.primary_palette = "DeepPurple"
-        self.theme_cls.material_style = "M3"
+        # KivyMD 2 uses Material 3 dynamic colors; provide a real RGBA palette source.
+        self.theme_cls.primary_palette = "#8b5cf6"
 
         self.storage = None
         self._storage_init_error = None
