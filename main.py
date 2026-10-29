@@ -649,7 +649,7 @@ class SplitItem(BaseToolItem):
                   app_ref=self.app_ref)
 
     def _pick_output(self):
-        pick_dir(self._on_output)
+        pick_dir(self._on_output, app_ref=self.app_ref, output=True)
 
     def _on_image(self, path):
         self.image_path = path
