@@ -18,6 +18,7 @@ from kivy.properties import NumericProperty
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.widget import Widget
 from kivy.uix.image import Image as KivyImage
+from kivy.uix.screenmanager import Screen, ScreenManager
 
 from kivymd.app import MDApp
 from kivymd.uix.boxlayout import MDBoxLayout
@@ -27,8 +28,7 @@ from kivymd.uix.button import MDButton, MDButtonText
 from kivymd.uix.textfield import MDTextField
 from kivymd.uix.slider import MDSlider
 from kivymd.uix.selectioncontrol import MDSwitch
-from kivymd.uix.progressbar import MDProgressBar
-from kivymd.uix.bottomnavigation import MDBottomNavigation, MDBottomNavigationItem
+from kivymd.uix.progressindicator import MDLinearProgressIndicator
 from kivymd.uix.dialog import (
     MDDialog, MDDialogHeadlineText, MDDialogSupportingText,
     MDDialogButtonContainer,
@@ -344,10 +344,12 @@ class HueBar(Widget):
 # ============================================================================
 #  BASE TOOL ITEM
 # ============================================================================
-class BaseToolItem(MDBottomNavigationItem):
-    def __init__(self, app_ref, **kw):
+class BaseToolItem(Screen):
+    def __init__(self, app_ref, text="", icon="", **kw):
         super().__init__(**kw)
         self.app_ref = app_ref
+        self.tab_text = text
+        self.tab_icon = icon
 
     def _label(self, text, color=FG, size=14, bold=False, height=None):
         return MDLabel(
@@ -471,7 +473,7 @@ class MergeItem(BaseToolItem):
         body.add_widget(self._button("Merge Tiles", self._do_merge,
                                      bg=GREEN, fg=BG_DEEP))
 
-        self.progress = MDProgressBar(size_hint_y=None, height=dp(4), value=0)
+        self.progress = MDLinearProgressIndicator(size_hint_y=None, height=dp(4), value=0, type="determinate")
         body.add_widget(self.progress)
 
         scroll.add_widget(body)
@@ -637,7 +639,7 @@ class SplitItem(BaseToolItem):
         body.add_widget(settings)
 
         body.add_widget(self._button("Split Map", self._do_split))
-        self.progress = MDProgressBar(size_hint_y=None, height=dp(4), value=0)
+        self.progress = MDLinearProgressIndicator(size_hint_y=None, height=dp(4), value=0, type="determinate")
         body.add_widget(self.progress)
 
         scroll.add_widget(body)
@@ -767,7 +769,7 @@ class TxDItem(BaseToolItem):
         body.add_widget(info)
 
         body.add_widget(self._button("Convert to TXD", self._do_convert))
-        self.progress = MDProgressBar(size_hint_y=None, height=dp(4), value=0)
+        self.progress = MDLinearProgressIndicator(size_hint_y=None, height=dp(4), value=0, type="determinate")
         body.add_widget(self.progress)
 
         scroll.add_widget(body)
@@ -1159,19 +1161,40 @@ class RadarApp(MDApp):
         root = MDBoxLayout(orientation="vertical",
                            md_bg_color=hex_rgba(BG_MAIN))
 
-        # Bottom navigation with all four tools
-        nav = MDBottomNavigation(panel_color=hex_rgba(BG_SIDEBAR))
-
+        # KivyMD 2.0 uses a separate navigation bar; keep each tool as a screen.
         self.merge_tab = MergeItem(self)
         self.split_tab = SplitItem(self)
         self.txd_tab = TxDItem(self)
         self.color_tab = ColorItem(self)
 
-        nav.add_widget(self.merge_tab)
-        nav.add_widget(self.split_tab)
-        nav.add_widget(self.txd_tab)
-        nav.add_widget(self.color_tab)
+        screen_manager = ScreenManager()
+        for screen in (self.merge_tab, self.split_tab, self.txd_tab, self.color_tab):
+            screen_manager.add_widget(screen)
+        screen_manager.current = self.merge_tab.name
+        root.add_widget(screen_manager)
 
+        nav = MDBoxLayout(
+            orientation="horizontal",
+            size_hint_y=None,
+            height=dp(56),
+            spacing=dp(2),
+            padding=(dp(4), 0, dp(4), 0),
+            md_bg_color=hex_rgba(BG_SIDEBAR),
+        )
+        for screen in (self.merge_tab, self.split_tab, self.txd_tab, self.color_tab):
+            button = MDButton(
+                MDButtonText(text=screen.tab_text),
+                style="text",
+                size_hint_x=1,
+                size_hint_y=None,
+                height=dp(48),
+            )
+            button.bind(
+                on_release=lambda _button, target=screen: setattr(
+                    screen_manager, "current", target.name
+                )
+            )
+            nav.add_widget(button)
         root.add_widget(nav)
 
         # Persistent status bar
