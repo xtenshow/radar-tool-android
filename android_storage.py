@@ -17,10 +17,9 @@ class AndroidStorage:
 
     def __init__(self, app_ref):
         from android import activity as android_activity
-        from jnius import autoclass, jarray
+        from jnius import autoclass
 
         self.app_ref = app_ref
-        self._jarray = jarray
         self.Intent = autoclass("android.content.Intent")
         self.DocumentsContract = autoclass("android.provider.DocumentsContract")
         self.Document = autoclass("android.provider.DocumentsContract$Document")
@@ -148,8 +147,7 @@ class AndroidStorage:
     def _display_name(self, uri):
         cursor = None
         try:
-            columns = self._jarray("java.lang.String")(
-                [self.OpenableColumns.DISPLAY_NAME])
+            columns = [self.OpenableColumns.DISPLAY_NAME]
             cursor = self.resolver.query(uri, columns, None, None, None)
             if cursor is not None and cursor.moveToFirst():
                 index = cursor.getColumnIndex(self.OpenableColumns.DISPLAY_NAME)
@@ -164,7 +162,7 @@ class AndroidStorage:
         tree_id = self.DocumentsContract.getTreeDocumentId(tree_uri)
         children_uri = self.DocumentsContract.buildChildDocumentsUriUsingTree(
             tree_uri, tree_id)
-        columns = self._jarray("java.lang.String")([
+        columns = [
             self.Document.COLUMN_DOCUMENT_ID,
             self.Document.COLUMN_DISPLAY_NAME,
             self.Document.COLUMN_MIME_TYPE,
@@ -207,7 +205,7 @@ class AndroidStorage:
         stream = self.resolver.openInputStream(uri)
         if stream is None:
             raise RuntimeError("Android could not open the selected file for reading.")
-        buffer = self._jarray("b")([0] * 32768)
+        buffer = [0] * 32768
         try:
             with open(path, "wb") as out:
                 while True:
@@ -229,7 +227,7 @@ class AndroidStorage:
             for offset in range(0, len(data), chunk_size):
                 chunk = data[offset:offset + chunk_size]
                 signed = [byte if byte < 128 else byte - 256 for byte in chunk]
-                stream.write(self._jarray("b")(signed))
+                stream.write(signed)
             stream.flush()
         finally:
             stream.close()
