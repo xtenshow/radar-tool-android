@@ -31,7 +31,7 @@ from kivymd.uix.selectioncontrol import MDSwitch
 from kivymd.uix.progressindicator import MDLinearProgressIndicator
 from kivymd.uix.dialog import (
     MDDialog, MDDialogHeadlineText, MDDialogSupportingText,
-    MDDialogButtonContainer,
+    MDDialogContentContainer, MDDialogButtonContainer,
 )
 
 from plyer import filechooser
@@ -948,7 +948,8 @@ class ColorItem(BaseToolItem):
         rcol = MDBoxLayout(orientation="vertical", spacing=dp(4))
         rcol.add_widget(self._label("REPLACE", color=FG_DIM, size=10,
                                     bold=True, height=dp(16)))
-        self._replace_swatch = ColorSwatch(hex_rgb(self.replace_rgb))
+        self._replace_swatch = ColorSwatch(
+            hex_rgb(self.replace_rgb), on_click=self._pick_replace_color)
         rcol.add_widget(self._replace_swatch)
         self._replace_label = self._label(str(self.replace_rgb),
                                           color=FG_MUTED, size=11,
@@ -1061,6 +1062,122 @@ class ColorItem(BaseToolItem):
         return True
 
     # -- params --------------------------------------------------------
+    def _pick_replace_color(self):
+        """Open an in-app RGB picker for the replacement color."""
+        rgb = list(self.replace_rgb)
+
+        preview = MDCard(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(48),
+            padding=dp(8),
+            radius=[dp(12)],
+            md_bg_color=hex_rgba(hex_rgb(rgb)),
+        )
+        preview_hex = MDLabel(
+            text=hex_rgb(rgb).upper(),
+            halign="center",
+            valign="middle",
+            theme_text_color="Custom",
+            text_color=hex_rgba(WHITE),
+            size_hint_y=None,
+            height=dp(30),
+        )
+        preview.add_widget(preview_hex)
+
+        content = MDBoxLayout(
+            orientation="vertical",
+            spacing=dp(10),
+            padding=(dp(12), dp(8), dp(12), dp(8)),
+            size_hint_y=None,
+            height=dp(230),
+        )
+        content.add_widget(preview)
+
+        channel_values = []
+        for index, channel_name in enumerate(("R", "G", "B")):
+            row = MDBoxLayout(
+                orientation="horizontal",
+                spacing=dp(8),
+                size_hint_y=None,
+                height=dp(42),
+            )
+            channel_label = MDLabel(
+                text=channel_name,
+                size_hint_x=None,
+                width=dp(22),
+                theme_text_color="Custom",
+                text_color=hex_rgba(FG),
+            )
+            value_label = MDLabel(
+                text=str(rgb[index]),
+                size_hint_x=None,
+                width=dp(34),
+                halign="right",
+                theme_text_color="Custom",
+                text_color=hex_rgba(FG_DIM),
+            )
+            slider = MDSlider(
+                min=0,
+                max=255,
+                value=rgb[index],
+                step=1,
+                size_hint_y=None,
+                height=dp(38),
+            )
+            channel_values.append((slider, value_label))
+            row.add_widget(channel_label)
+            row.add_widget(slider)
+            row.add_widget(value_label)
+            content.add_widget(row)
+
+        def update_preview(*_args):
+            for channel, (slider, value_label) in enumerate(channel_values):
+                rgb[channel] = max(0, min(255, int(round(slider.value))))
+                value_label.text = str(rgb[channel])
+            color = hex_rgb(tuple(rgb))
+            preview.md_bg_color = hex_rgba(color)
+            preview_hex.text = color.upper()
+            # Keep the preview text readable against both dark and light colors.
+            brightness = (rgb[0] * 299 + rgb[1] * 587 + rgb[2] * 114) / 1000
+            preview_hex.text_color = hex_rgba(BG_DEEP if brightness > 150 else WHITE)
+
+        for slider, _value_label in channel_values:
+            slider.bind(value=update_preview)
+
+        dialog = MDDialog(
+            MDDialogHeadlineText(text="Replacement RGB color"),
+            MDDialogSupportingText(
+                text="Adjust the red, green and blue channels."),
+            MDDialogContentContainer(
+                content,
+                orientation="vertical",
+            ),
+            MDDialogButtonContainer(
+                Widget(),
+                MDButton(
+                    MDButtonText(text="Cancel"),
+                    style="text",
+                    on_release=lambda *_: dialog.dismiss(),
+                ),
+                MDButton(
+                    MDButtonText(text="Apply"),
+                    style="filled",
+                    md_bg_color=hex_rgba(PRIMARY),
+                    on_release=lambda *_: self._apply_replace_rgb(dialog, rgb),
+                ),
+                spacing=dp(8),
+            ),
+        )
+        dialog.open()
+
+    def _apply_replace_rgb(self, dialog, rgb):
+        dialog.dismiss()
+        self.replace_rgb = tuple(max(0, min(255, int(v))) for v in rgb)
+        self._replace_swatch.set_color(hex_rgb(self.replace_rgb))
+        self._replace_label.text = str(self.replace_rgb)
+        self._schedule_preview()
+
     def _on_hue_change(self, r, g, b):
         self.replace_rgb = (r, g, b)
         self._replace_swatch.set_color(hex_rgb(self.replace_rgb))
