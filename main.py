@@ -35,6 +35,7 @@ from kivymd.uix.dialog import (
 )
 
 from plyer import filechooser
+from android_storage import AndroidStorage
 
 try:
     from android.permissions import request_permissions, Permission
@@ -109,24 +110,68 @@ def pil_to_texture(pil_img):
     return tex
 
 
-def pick_file(on_pick, filters=None):
-    def cb(sel):
-        if sel:
-            on_pick(sel[0])
+def _picker_error(app_ref, title, exc):
+    message = str(exc).strip() or "The file picker could not be opened."
+    if app_ref is not None:
+        app_ref.set_status("File access failed", RED)
+        app_ref.show_dialog(title, message[:1200])
+
+
+def pick_file(on_pick, filters=None, app_ref=None):
+    if ANDROID:
+        if app_ref is None or app_ref.storage is None:
+            _picker_error(app_ref, "Android file access unavailable",
+                          "The Android Storage Access Framework could not be initialized.")
+            return
+        app_ref.storage.pick_file(on_pick, mime_type="image/*")
+        return
+
+    def cb(selection):
+        if selection:
+            on_pick(selection[0])
+
     try:
         filechooser.open_file(on_selection=cb, filters=filters or [])
-    except Exception:
-        pass
+    except Exception as exc:
+        _picker_error(app_ref, "File picker error", exc)
 
 
-def pick_dir(on_pick):
-    def cb(sel):
-        if sel:
-            on_pick(sel[0])
+def pick_dir(on_pick, app_ref=None, output=False):
+    if ANDROID:
+        if app_ref is None or app_ref.storage is None:
+            _picker_error(app_ref, "Android folder access unavailable",
+                          "The Android Storage Access Framework could not be initialized.")
+            return
+        app_ref.storage.pick_directory(output=output, callback=on_pick)
+        return
+
+    def cb(selection):
+        if selection:
+            on_pick(selection[0])
+
     try:
         filechooser.choose_dir(on_selection=cb)
-    except Exception:
-        pass
+    except Exception as exc:
+        _picker_error(app_ref, "Folder picker error", exc)
+
+
+def pick_save_file(on_pick, app_ref=None, default_name="recolored.png"):
+    if ANDROID:
+        if app_ref is None or app_ref.storage is None:
+            _picker_error(app_ref, "Android save unavailable",
+                          "The Android Storage Access Framework could not be initialized.")
+            return
+        app_ref.storage.pick_save_file(on_pick, default_name=default_name)
+        return
+
+    def cb(selection):
+        if selection:
+            on_pick(selection[0])
+
+    try:
+        filechooser.save_file(on_selection=cb, filters=["*.png"])
+    except Exception as exc:
+        _picker_error(app_ref, "Save picker error", exc)
 
 
 # ============================================================================
@@ -434,10 +479,10 @@ class MergeItem(BaseToolItem):
         self.add_widget(content)
 
     def _pick_input(self):
-        pick_dir(self._on_input)
+        pick_dir(self._on_input, app_ref=self.app_ref, output=False)
 
     def _pick_output(self):
-        pick_dir(self._on_output)
+        pick_dir(self._on_output, app_ref=self.app_ref, output=True)
 
     def _on_input(self, path):
         self.input_folder = path
@@ -472,25 +517,33 @@ class MergeItem(BaseToolItem):
 
     def _worker(self, in_dir, out_dir, tw, th, flip):
         try:
+            missing = [
+                f"radar{i:02}.png"
+                for i in range(TOTAL_TILES)
+                if not os.path.isfile(os.path.join(in_dir, f"radar{i:02}.png"))
+            ]
+            if missing:
+                shown = ", ".join(missing[:24])
+                suffix = f" ... and {len(missing) - 24} more" if len(missing) > 24 else ""
+                self._fail(
+                    f"Merge cancelled: {len(missing)} of {TOTAL_TILES} required tiles are missing. "
+                    f"Missing: {shown}{suffix}"
+                )
+                return
+
             canvas = Image.new("RGBA", (tw * GRID_SIZE, th * GRID_SIZE))
             found = 0
             for i in range(TOTAL_TILES):
                 p = os.path.join(in_dir, f"radar{i:02}.png")
-                if not os.path.exists(p):
-                    continue
-                img = Image.open(p)
+                with Image.open(p) as source:
+                    img = source.convert("RGBA")
                 if img.size != (tw, th):
                     img = img.resize((tw, th), Image.LANCZOS)
-                if img.mode != "RGBA":
-                    img = img.convert("RGBA")
                 x, y = tile_position(i, tw, th, flip)
                 canvas.paste(img, (x, y))
                 found += 1
                 if i % 12 == 0:
                     self._update_progress(found / TOTAL_TILES)
-            if found == 0:
-                self._fail("No radar tiles found in input folder.")
-                return
             canvas.save(os.path.join(out_dir, "map.png"))
             self._done(found, tw, th)
         except Exception as e:
@@ -502,6 +555,16 @@ class MergeItem(BaseToolItem):
 
     @mainthread
     def _done(self, found, tw, th):
+        try:
+            if self.app_ref.storage is not None:
+                self.app_ref.storage.export_directory_if_needed(self.output_folder)
+        except Exception as exc:
+            self.progress.value = 0
+            self.app_ref.set_status("Export failed", RED)
+            self.app_ref.show_dialog(
+                "Export failed",
+                f"map.png was generated in app storage, but could not be exported:\n{exc}")
+            return
         self.progress.value = 100
         self.app_ref.set_status(f"Merged {found} tiles -> map.png", GREEN)
         self.app_ref.show_dialog(
@@ -582,10 +645,11 @@ class SplitItem(BaseToolItem):
         self.add_widget(content)
 
     def _pick_image(self):
-        pick_file(self._on_image, filters=["*.png", "*.jpg", "*.jpeg"])
+        pick_file(self._on_image, filters=["*.png", "*.jpg", "*.jpeg"],
+                  app_ref=self.app_ref)
 
     def _pick_output(self):
-        pick_dir(self._on_output)
+        pick_dir(self._on_output, app_ref=self.app_ref, output=True)
 
     def _on_image(self, path):
         self.image_path = path
@@ -618,12 +682,11 @@ class SplitItem(BaseToolItem):
 
     def _worker(self, img_path, out_dir, tw, th, flip):
         try:
-            img = Image.open(img_path)
+            with Image.open(img_path) as source:
+                img = source.convert("RGBA")
             target = (tw * GRID_SIZE, th * GRID_SIZE)
             if img.size != target:
                 img = img.resize(target, Image.LANCZOS)
-            if img.mode != "RGBA":
-                img = img.convert("RGBA")
             for i in range(TOTAL_TILES):
                 x, y = tile_position(i, tw, th, flip)
                 img.crop((x, y, x + tw, y + th)).save(
@@ -640,6 +703,16 @@ class SplitItem(BaseToolItem):
 
     @mainthread
     def _done(self, tw, th):
+        try:
+            if self.app_ref.storage is not None:
+                self.app_ref.storage.export_directory_if_needed(self.output_folder)
+        except Exception as exc:
+            self.progress.value = 0
+            self.app_ref.set_status("Export failed", RED)
+            self.app_ref.show_dialog(
+                "Export failed",
+                f"Tiles were generated in app storage, but could not be exported:\n{exc}")
+            return
         self.progress.value = 100
         self.app_ref.set_status("Exported 144 tiles", GREEN)
         self.app_ref.show_dialog(
@@ -702,10 +775,10 @@ class TxDItem(BaseToolItem):
         self.add_widget(content)
 
     def _pick_input(self):
-        pick_dir(self._on_input)
+        pick_dir(self._on_input, app_ref=self.app_ref, output=False)
 
     def _pick_output(self):
-        pick_dir(self._on_output)
+        pick_dir(self._on_output, app_ref=self.app_ref, output=True)
 
     def _on_input(self, path):
         self.input_folder = path
@@ -740,9 +813,8 @@ class TxDItem(BaseToolItem):
             for idx, f in enumerate(files):
                 try:
                     name = os.path.splitext(f)[0]
-                    data = make_txd(
-                        name,
-                        Image.open(os.path.join(self.input_folder, f)))
+                    with Image.open(os.path.join(self.input_folder, f)) as source:
+                        data = make_txd(name, source)
                     with open(os.path.join(self.output_folder,
                                            name + ".txd"), "wb") as fh:
                         fh.write(data)
@@ -760,6 +832,16 @@ class TxDItem(BaseToolItem):
 
     @mainthread
     def _done(self, ok, err_count, errors):
+        try:
+            if self.app_ref.storage is not None:
+                self.app_ref.storage.export_directory_if_needed(self.output_folder)
+        except Exception as exc:
+            self.progress.value = 0
+            self.app_ref.set_status("Export failed", RED)
+            self.app_ref.show_dialog(
+                "Export failed",
+                f"TXD files were generated in app storage, but could not be exported:\n{exc}")
+            return
         self.progress.value = 100
         if err_count:
             self.app_ref.set_status(
@@ -848,8 +930,8 @@ class ColorItem(BaseToolItem):
         tcol = MDBoxLayout(orientation="vertical", spacing=dp(4))
         tcol.add_widget(self._label("TARGET", color=FG_DIM, size=10,
                                     bold=True, height=dp(16)))
-        self._target_swatch = ColorSwatch(hex_rgb(self.target_rgb),
-                                          on_click=self._pick_target_via_hue)
+        # Target color is sampled from the original image; this swatch is display-only.
+        self._target_swatch = ColorSwatch(hex_rgb(self.target_rgb))
         tcol.add_widget(self._target_swatch)
         self._target_label = self._label(str(self.target_rgb),
                                          color=FG_MUTED, size=11,
@@ -912,7 +994,8 @@ class ColorItem(BaseToolItem):
 
     # -- image picking --------------------------------------------------
     def _pick_image(self):
-        pick_file(self._on_image, filters=["*.png", "*.jpg", "*.jpeg"])
+        pick_file(self._on_image, filters=["*.png", "*.jpg", "*.jpeg"],
+                  app_ref=self.app_ref)
 
     def _on_image(self, path):
         self.app_ref.set_status("Loading image...", YELLOW)
@@ -975,13 +1058,6 @@ class ColorItem(BaseToolItem):
         self._schedule_preview()
         return True
 
-    def _pick_target_via_hue(self):
-        # Simple: set target to current replacement color
-        self.target_rgb = self.replace_rgb
-        self._target_swatch.set_color(hex_rgb(self.target_rgb))
-        self._target_label.text = str(self.target_rgb)
-        self._schedule_preview()
-
     # -- params --------------------------------------------------------
     def _on_hue_change(self, r, g, b):
         self.replace_rgb = (r, g, b)
@@ -1018,20 +1094,15 @@ class ColorItem(BaseToolItem):
             return self.app_ref.show_dialog(
                 "Error", "Please load an image first.")
 
-        def on_pick(paths):
-            if not paths:
+        def on_pick(output_path):
+            if not output_path:
                 return
-            out = paths[0]
             self.app_ref.set_status("Applying color replacement...", YELLOW)
             threading.Thread(target=self._save_worker,
-                             args=(out,), daemon=True).start()
+                             args=(output_path,), daemon=True).start()
 
-        try:
-            filechooser.save_file(on_selection=on_pick,
-                                  filters=["*.png"])
-        except Exception:
-            self.app_ref.show_dialog(
-                "Error", "File picker unavailable on this device.")
+        pick_save_file(on_pick, app_ref=self.app_ref,
+                       default_name="recolored.png")
 
     def _save_worker(self, out_path):
         try:
@@ -1046,11 +1117,20 @@ class ColorItem(BaseToolItem):
 
     @mainthread
     def _save_done(self, path):
-        self.app_ref.set_status(
-            f"Saved -> {os.path.basename(path)}", GREEN)
+        try:
+            filename = os.path.basename(path)
+            if self.app_ref.storage is not None:
+                filename = self.app_ref.storage.export_file_if_needed(path)
+        except Exception as exc:
+            self.app_ref.set_status("Export failed", RED)
+            self.app_ref.show_dialog(
+                "Export failed",
+                f"The image was created in app storage, but export failed:\n{exc}")
+            return
+
+        self.app_ref.set_status(f"Saved -> {filename}", GREEN)
         self.app_ref.show_dialog(
-            "Done",
-            f"Color replaced and saved!\n{os.path.basename(path)}")
+            "Done", f"Color replaced and saved!\n{filename}")
 
     @mainthread
     def _save_fail(self, msg):
@@ -1068,16 +1148,13 @@ class RadarApp(MDApp):
         self.theme_cls.primary_palette = "DeepPurple"
         self.theme_cls.material_style = "M3"
 
-        # Request Android permissions once at startup
+        self.storage = None
+        self._storage_init_error = None
         if ANDROID:
             try:
-                request_permissions([
-                    Permission.READ_EXTERNAL_STORAGE,
-                    Permission.WRITE_EXTERNAL_STORAGE,
-                    Permission.READ_MEDIA_IMAGES,
-                ])
-            except Exception:
-                pass
+                self.storage = AndroidStorage(self)
+            except Exception as exc:
+                self._storage_init_error = str(exc)
 
         root = MDBoxLayout(orientation="vertical",
                            md_bg_color=hex_rgba(BG_MAIN))
@@ -1122,6 +1199,14 @@ class RadarApp(MDApp):
         status_box.add_widget(self._status_dot)
         status_box.add_widget(self._status_label)
         root.add_widget(status_box)
+
+        if self._storage_init_error:
+            Clock.schedule_once(
+                lambda dt: self.show_dialog(
+                    "Android storage initialization failed",
+                    "File and folder operations may not work. "
+                    + self._storage_init_error),
+                0.2)
 
         return root
 
