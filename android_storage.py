@@ -166,7 +166,7 @@ class AndroidStorage:
             self.Document.COLUMN_DOCUMENT_ID,
             self.Document.COLUMN_DISPLAY_NAME,
             self.Document.COLUMN_MIME_TYPE,
-        ])
+        ]
         cursor = self.resolver.query(children_uri, columns, None, None, None)
         if cursor is None:
             raise RuntimeError(
