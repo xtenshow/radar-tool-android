@@ -39,6 +39,18 @@ jobs:
       - name: Validate Python syntax
         run: python -m compileall -q main.py android_storage.py
 
+      - name: Package source archive
+        run: |
+          zip -qr "$RUNNER_TEMP/RadarTool-Android-Source.zip" . \
+            -x ".git/*" ".buildozer/*" "bin/*" "*/__pycache__/*" "*.pyc"
+
+      - name: Upload source archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: RadarTool-Android-Source
+          path: ${{ runner.temp }}/RadarTool-Android-Source.zip
+          if-no-files-found: error
+
       - name: Build APK with Buildozer
         run: |
           buildozer android debug
