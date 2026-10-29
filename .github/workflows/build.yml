@@ -4,6 +4,8 @@ on:
   workflow_dispatch:
   push:
     branches: [ main ]
+  pull_request:
+    branches: [ main ]
 
 jobs:
   build:
@@ -31,8 +33,11 @@ jobs:
 
       - name: Install Buildozer & Cython
         run: |
-          pip install --upgrade pip
-          pip install buildozer cython
+          pip install --upgrade pip==24.3.1
+          pip install buildozer==1.5.0 Cython==0.29.36
+
+      - name: Validate Python syntax
+        run: python -m compileall -q main.py android_storage.py
 
       - name: Build APK with Buildozer
         run: |
