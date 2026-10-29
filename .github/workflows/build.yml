@@ -7,6 +7,15 @@ on:
   pull_request:
     branches: [ main ]
 
+# Prevent overlapping builds on the same ref.
+concurrency:
+  group: radar-tool-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -20,6 +29,28 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
+      - name: Cancel previous queued/running builds
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          previous_runs="$(gh run list \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow build.yml \
+            --limit 100 \
+            --json databaseId,status \
+            --jq ".[] | select(.status == \"queued\" or .status == \"in_progress\") | select(.databaseId != $GITHUB_RUN_ID) | .databaseId")"
+          if [ -n "$previous_runs" ]; then
+            while IFS= read -r run_id; do
+              [ -n "$run_id" ] || continue
+              echo "Cancelling previous workflow run $run_id"
+              gh run cancel "$run_id" --repo "$GITHUB_REPOSITORY"
+            done <<< "$previous_runs"
+          else
+            echo "No previous queued or running builds found."
+          fi
 
       - name: Install system dependencies
         run: |
