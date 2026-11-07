@@ -42,6 +42,8 @@ def commit_staged_files(staging_directory, output_directory, filenames):
         filename = str(filename)
         if not filename or filename in (".", "..") or os.path.basename(filename) != filename:
             raise ValueError("Unsafe output filename: " + repr(filename))
+        if filename in names:
+            raise ValueError("Duplicate output filename: " + repr(filename))
         if not os.path.isfile(os.path.join(staging_directory, filename)):
             raise FileNotFoundError("Staged output is missing: " + filename)
         names.append(filename)
