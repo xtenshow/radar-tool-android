@@ -108,6 +108,7 @@ jobs:
           p4a_dir = Path(sys.argv[1]).resolve()
           build_file = p4a_dir / "pythonforandroid" / "build.py"
           source = build_file.read_text(encoding="utf-8")
+
           start_marker = "        shprint(host_python, '-m', 'venv', 'venv')"
           end_marker = "        # Install Cython in case modules need it to build:"
           if source.count(start_marker) != 1:
@@ -117,6 +118,7 @@ jobs:
           old_block = source[start:end]
           if old_block.count("pip install -U pip") != 1:
               raise SystemExit("Expected exactly one pip self-upgrade in p4a build.py")
+
           new_block = (
               "        shprint(host_python, '-m', 'venv', '--clear', 'venv')\\n"
               "\\n"
@@ -128,9 +130,14 @@ jobs:
           source = source[:start] + new_block + source[end:]
           build_file.write_text(source, encoding="utf-8")
 
-          if source.count(old) != 1:
-              raise SystemExit("Unexpected p4a build.py version; refusing an unsafe patch")
-          build_file.write_text(source.replace(old, new), encoding="utf-8")
+          patched = build_file.read_text(encoding="utf-8")
+          check_start = patched.index("        shprint(host_python, '-m', 'venv', '--clear', 'venv')")
+          check_end = patched.index(end_marker, check_start)
+          patched_block = patched[check_start:check_end]
+          if "pip install -U pip" in patched_block:
+              raise SystemExit("pip self-upgrade is still present in patched block")
+          if "venv', '--clear', 'venv'" not in patched_block:
+              raise SystemExit("venv --clear patch verification failed")
 
           spec_path = Path(sys.argv[2])
           spec = spec_path.read_text(encoding="utf-8")
@@ -139,11 +146,7 @@ jobs:
           if spec.count(old_spec) != 1:
               raise SystemExit("Could not safely pin p4a.source_dir in buildozer.spec")
           spec_path.write_text(spec.replace(old_spec, new_spec), encoding="utf-8")
-
-          patched = build_file.read_text(encoding="utf-8")
-          if "venv', '--clear', 'venv'" not in patched or "pip install -U pip" in patched:
-              raise SystemExit("python-for-android pip fix verification failed")
-          print("Using python-for-android v2026.05.09 with the isolated-venv fix.")
+          print("Pinned p4a v2026.05.09 and applied the upstream pip venv fix.")
           PY
 
       - name: Build APK with Buildozer
