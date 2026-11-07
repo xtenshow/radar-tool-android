@@ -1113,8 +1113,10 @@ class ColorItem(BaseToolItem):
         body.add_widget(tol_card)
 
         # --- save ---
-        body.add_widget(self._button("Save Result", self._save,
-                                     bg=GREEN, fg=BG_DEEP))
+        self.action_button = self._button(
+            "Save Result", self._save, bg=GREEN, fg=BG_DEEP
+        )
+        body.add_widget(self.action_button)
 
         scroll.add_widget(body)
         content.add_widget(scroll)
@@ -1371,7 +1373,9 @@ class ColorItem(BaseToolItem):
                 "Recolored and saved image", self.image_path, output_path
             ):
                 return
-            image_snapshot = self.pil_image.copy()
+            # Keep a reference to the immutable source image instead of making
+            # a second full-size copy on the UI thread.
+            image_snapshot = self.pil_image
             target_snapshot = tuple(self.target_rgb)
             replace_snapshot = tuple(self.replace_rgb)
             tolerance_snapshot = int(self.tolerance)
@@ -1396,14 +1400,18 @@ class ColorItem(BaseToolItem):
             result = recolor_image(image, target_rgb, replace_rgb, tolerance)
             _safe_save_image(result, out_path)
             filename = os.path.basename(out_path)
+            output_description = out_path
             if self.app_ref.storage is not None:
+                output_description = self.app_ref.storage.describe_path(out_path)
                 filename = self.app_ref.storage.export_file_if_needed(out_path)
-            self._save_done(filename)
+            self._save_done(filename, output_description)
         except Exception as exc:
             self._save_fail(str(exc))
 
     @mainthread
-    def _save_done(self, filename):
+    def _save_done(self, filename, output_description):
+        if self._history_context is not None:
+            self._history_context["output_path"] = output_description
         self.app_ref.set_status(f"Saved -> {filename}", GREEN)
         self._finish_operation(True, f"Saved file: {filename}")
         self.app_ref.show_dialog(
