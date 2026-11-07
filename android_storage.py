@@ -27,6 +27,8 @@ class AndroidStorage:
         self.activity = autoclass("org.kivy.android.PythonActivity").mActivity
         self.resolver = self.activity.getContentResolver()
         self._pending = {}
+        self._input_dirs = {}
+        self._input_files = {}
         self._output_dirs = {}
         self._output_files = {}
         self._next_request_code = self.REQUEST_CODE_BASE
@@ -122,13 +124,16 @@ class AndroidStorage:
         local_dir = self._new_staging_dir("input_file_")
         local_path = os.path.join(local_dir, self._safe_name(name))
         self._copy_uri_to_path(uri, local_path)
+        self._input_files[os.path.realpath(local_path)] = uri
         callback(local_path)
 
     def _finish_directory_pick(self, tree_uri, output, callback):
         local_dir = self._new_staging_dir("output_" if output else "input_")
+        key = os.path.realpath(local_dir)
         if output:
-            self._output_dirs[os.path.realpath(local_dir)] = tree_uri
+            self._output_dirs[key] = tree_uri
         else:
+            self._input_dirs[key] = tree_uri
             self._copy_tree_files_to_directory(tree_uri, local_dir)
         callback(local_dir)
 
@@ -277,6 +282,26 @@ class AndroidStorage:
         for path in files:
             self._write_file_to_tree(tree_uri, path)
         return len(files)
+
+    def describe_path(self, local_path):
+        """Return a useful source/destination address for history entries.
+
+        SAF items do not expose ordinary filesystem paths; their content URI is
+        the stable address available to the app.
+        """
+        if not local_path:
+            return ""
+        key = os.path.realpath(local_path)
+        for mapping, label in (
+            (self._input_dirs, "Android input folder"),
+            (self._output_dirs, "Android output folder"),
+            (self._input_files, "Android input file"),
+            (self._output_files, "Android output file"),
+        ):
+            uri = mapping.get(key)
+            if uri is not None:
+                return label + ": " + str(uri.toString())
+        return str(local_path)
 
     def export_file_if_needed(self, local_path):
         key = os.path.realpath(local_path)
