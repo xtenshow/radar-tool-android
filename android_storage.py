@@ -7,6 +7,8 @@ are then exported to the user-selected SAF destination.
 import mimetypes
 import os
 import tempfile
+import threading
+from kivy.clock import Clock
 
 
 class AndroidStorage:
@@ -39,8 +41,20 @@ class AndroidStorage:
 
     def _report_error(self, title, exc):
         message = str(exc).strip() or "Android storage operation failed."
-        self.app_ref.set_status("File access failed", "#ef4444")
-        self.app_ref.show_dialog(title, message[:1200])
+
+        def report(_dt):
+            try:
+                self.app_ref.set_status("File access failed", "#ef4444")
+                self.app_ref.show_dialog(title, message[:1200])
+            except Exception:
+                pass
+
+        Clock.schedule_once(report, 0)
+
+    @staticmethod
+    def _dispatch_callback(callback, value):
+        if callback is not None:
+            Clock.schedule_once(lambda _dt: callback(value), 0)
 
     def _launch(self, intent, request):
         code = self._next_request_code
@@ -98,14 +112,37 @@ class AndroidStorage:
         except Exception:
             return
         request = self._pending.pop(code, None)
-        if request is None:
-            return
-        if int(result_code) != self.RESULT_OK or intent is None:
+        if request is None or int(result_code) != self.RESULT_OK or intent is None:
             return
         try:
             uri = intent.getData()
             if uri is None:
                 raise RuntimeError("Android returned no document URI.")
+
+            # Keep the provider grant for the current app installation.
+            granted = int(intent.getFlags()) & (
+                self.Intent.FLAG_GRANT_READ_URI_PERMISSION
+                | self.Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            )
+            if granted:
+                try:
+                    self.resolver.takePersistableUriPermission(uri, granted)
+                except Exception:
+                    # Some document providers do not offer persistable grants.
+                    pass
+
+            # Folder enumeration and byte copying must not block Android's UI.
+            worker = threading.Thread(
+                target=self._process_activity_result,
+                args=(uri, request),
+                daemon=True,
+            )
+            worker.start()
+        except Exception as exc:
+            self._report_error("Could not access the selected item", exc)
+
+    def _process_activity_result(self, uri, request):
+        try:
             kind = request["kind"]
             if kind == "file":
                 self._finish_file_pick(uri, request["callback"])
@@ -204,7 +241,10 @@ class AndroidStorage:
                 document_uri, os.path.join(local_dir, self._safe_name(name)))
             copied += 1
         if copied == 0:
-            self.app_ref.set_status("Selected folder is empty", "#f59e0b")
+            Clock.schedule_once(
+                lambda _dt: self.app_ref.set_status("Selected folder is empty", "#f59e0b"),
+                0,
+            )
 
     def _copy_uri_to_path(self, uri, path):
         stream = self.resolver.openInputStream(uri)
@@ -218,7 +258,7 @@ class AndroidStorage:
                     if count < 0:
                         break
                     if count == 0:
-                        continue
+                        raise RuntimeError("Android returned an empty read while copying a file.")
                     out.write(bytes((int(buffer[i]) & 0xff) for i in range(count)))
         finally:
             stream.close()
@@ -249,19 +289,98 @@ class AndroidStorage:
                         f"Cannot replace existing file {name!r} in the selected folder.")
                 return
 
+    def _copy_file_to_uri(self, uri, local_path):
+        stream = self.resolver.openOutputStream(uri)
+        if stream is None:
+            raise RuntimeError("Android could not open the destination for writing.")
+        try:
+            with open(local_path, "rb") as source:
+                while True:
+                    chunk = source.read(32768)
+                    if not chunk:
+                        break
+                    signed = [byte if byte < 128 else byte - 256 for byte in chunk]
+                    stream.write(signed)
+            stream.flush()
+        finally:
+            stream.close()
+
     def _write_file_to_tree(self, tree_uri, local_path):
         filename = self._safe_name(os.path.basename(local_path))
         mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-        self._delete_existing_child(tree_uri, filename)
         tree_id = self.DocumentsContract.getTreeDocumentId(tree_uri)
         parent_uri = self.DocumentsContract.buildDocumentUriUsingTree(
-            tree_uri, tree_id)
-        target_uri = self.DocumentsContract.createDocument(
-            self.resolver, parent_uri, mime_type, filename)
-        if target_uri is None:
-            raise RuntimeError(f"Android could not create {filename!r} in the selected folder.")
-        with open(local_path, "rb") as source:
-            self._write_bytes_to_uri(target_uri, source.read())
+            tree_uri, tree_id
+        )
+
+        # Stage the new data under a temporary name. If a previous output
+        # exists, rename it aside first; never delete the old output before the
+        # new file has been fully written.
+        existing_uri = None
+        for doc_id, existing_name, _mime_type in self._list_children(tree_uri):
+            if existing_name == filename:
+                existing_uri = self.DocumentsContract.buildDocumentUriUsingTree(
+                    tree_uri, doc_id
+                )
+                break
+
+        backup_uri = None
+        backup_name = ".radartool-backup-" + os.urandom(6).hex()
+        if existing_uri is not None:
+            backup_uri = self.DocumentsContract.renameDocument(
+                self.resolver, existing_uri, backup_name
+            )
+            if backup_uri is None:
+                raise RuntimeError(
+                    "The selected folder provider cannot safely replace "
+                    f"{filename!r}; the existing file was left untouched."
+                )
+
+        temporary_name = ".radartool-new-" + os.urandom(6).hex()
+        temporary_uri = None
+        try:
+            temporary_uri = self.DocumentsContract.createDocument(
+                self.resolver, parent_uri, mime_type, temporary_name
+            )
+            if temporary_uri is None:
+                raise RuntimeError("Android could not create a temporary output file.")
+            self._copy_file_to_uri(temporary_uri, local_path)
+            final_uri = self.DocumentsContract.renameDocument(
+                self.resolver, temporary_uri, filename
+            )
+            if final_uri is None:
+                raise RuntimeError(
+                    "The selected folder provider cannot rename the completed "
+                    f"temporary file to {filename!r}."
+                )
+            temporary_uri = None
+        except Exception as write_error:
+            if temporary_uri is not None:
+                try:
+                    self.DocumentsContract.deleteDocument(self.resolver, temporary_uri)
+                except Exception:
+                    pass
+            if backup_uri is not None:
+                try:
+                    restored = self.DocumentsContract.renameDocument(
+                        self.resolver, backup_uri, filename
+                    )
+                    if restored is None:
+                        raise RuntimeError("Provider returned no URI while restoring backup.")
+                except Exception as restore_error:
+                    raise RuntimeError(
+                        f"Writing {filename!r} failed. The old file remains under "
+                        f"backup name {backup_name!r}; restoration failed: {restore_error}"
+                    ) from write_error
+            raise
+
+        if backup_uri is not None:
+            try:
+                self.DocumentsContract.deleteDocument(self.resolver, backup_uri)
+            except Exception:
+                # New file is valid; keep the hidden backup rather than fail
+                # the completed export or risk removing the new file.
+                pass
 
     def export_directory_if_needed(self, local_directory):
         tree_uri = self._output_dirs.get(os.path.realpath(local_directory))
@@ -309,7 +428,6 @@ class AndroidStorage:
         if uri is None:
             return os.path.basename(local_path)
         display_name = self._display_name(uri) or os.path.basename(local_path)
-        with open(local_path, "rb") as source:
-            self._write_bytes_to_uri(uri, source.read())
+        self._copy_file_to_uri(uri, local_path)
         self._output_files.pop(key, None)
         return display_name
