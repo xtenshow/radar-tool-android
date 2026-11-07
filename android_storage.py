@@ -162,7 +162,7 @@ class AndroidStorage:
         local_path = os.path.join(local_dir, self._safe_name(name))
         self._copy_uri_to_path(uri, local_path)
         self._input_files[os.path.realpath(local_path)] = uri
-        callback(local_path)
+        self._dispatch_callback(callback, local_path)
 
     def _finish_directory_pick(self, tree_uri, output, callback):
         local_dir = self._new_staging_dir("output_" if output else "input_")
@@ -172,13 +172,13 @@ class AndroidStorage:
         else:
             self._input_dirs[key] = tree_uri
             self._copy_tree_files_to_directory(tree_uri, local_dir)
-        callback(local_dir)
+        self._dispatch_callback(callback, local_dir)
 
     def _finish_save_pick(self, uri, callback):
         local_dir = self._new_staging_dir("save_")
         local_path = os.path.join(local_dir, "recolored.png")
         self._output_files[os.path.realpath(local_path)] = uri
-        callback(local_path)
+        self._dispatch_callback(callback, local_path)
 
     @staticmethod
     def _safe_name(name):
