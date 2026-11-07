@@ -13,7 +13,7 @@ fullscreen = 0
 
 # Android Storage Access Framework is used; broad storage permissions are not needed.
 android.api = 33
-android.minapi = 26
+android.minapi = 21
 android.ndk = 25b
 android.accept_sdk_license = True
 android.numeric_version = 102611000
