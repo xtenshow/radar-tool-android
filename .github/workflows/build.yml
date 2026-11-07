@@ -70,7 +70,10 @@ jobs:
           pip install buildozer==1.5.0 Cython==0.29.36
 
       - name: Validate Python syntax
-        run: python -m compileall -q main.py android_storage.py operation_history.py file_transactions.py tests
+        run: python -m compileall -q main.py android_storage.py operation_history.py file_transactions.py image_algorithms.py tests
+
+      - name: Install Pillow for image regression tests
+        run: pip install Pillow
 
       - name: Run safety and persistence tests
         run: python -m unittest discover -s tests -v
