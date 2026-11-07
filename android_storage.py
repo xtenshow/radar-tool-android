@@ -313,9 +313,6 @@ class AndroidStorage:
             tree_uri, tree_id
         )
 
-        # Stage the new data under a temporary name. If a previous output
-        # exists, rename it aside first; never delete the old output before the
-        # new file has been fully written.
         existing_uri = None
         for doc_id, existing_name, _mime_type in self._list_children(tree_uri):
             if existing_name == filename:
@@ -336,30 +333,47 @@ class AndroidStorage:
                     f"{filename!r}; the existing file was left untouched."
                 )
 
-        temporary_name = ".radartool-new-" + os.urandom(6).hex()
+        output_uri = None
         temporary_uri = None
         try:
-            temporary_uri = self.DocumentsContract.createDocument(
-                self.resolver, parent_uri, mime_type, temporary_name
-            )
-            if temporary_uri is None:
-                raise RuntimeError("Android could not create a temporary output file.")
-            self._copy_file_to_uri(temporary_uri, local_path)
-            final_uri = self.DocumentsContract.renameDocument(
-                self.resolver, temporary_uri, filename
-            )
-            if final_uri is None:
-                raise RuntimeError(
-                    "The selected folder provider cannot rename the completed "
-                    f"temporary file to {filename!r}."
+            if backup_uri is None:
+                # No previous output exists, so create the final file directly.
+                # This also supports providers that do not implement rename.
+                output_uri = self.DocumentsContract.createDocument(
+                    self.resolver, parent_uri, mime_type, filename
                 )
-            temporary_uri = None
+                if output_uri is None:
+                    raise RuntimeError(
+                        f"Android could not create {filename!r} in the selected folder."
+                    )
+                self._copy_file_to_uri(output_uri, local_path)
+            else:
+                # Preserve the previous file under a backup name until the
+                # completed replacement has been written and renamed.
+                temporary_name = ".radartool-new-" + os.urandom(6).hex()
+                temporary_uri = self.DocumentsContract.createDocument(
+                    self.resolver, parent_uri, mime_type, temporary_name
+                )
+                if temporary_uri is None:
+                    raise RuntimeError("Android could not create a temporary output file.")
+                self._copy_file_to_uri(temporary_uri, local_path)
+                output_uri = self.DocumentsContract.renameDocument(
+                    self.resolver, temporary_uri, filename
+                )
+                if output_uri is None:
+                    raise RuntimeError(
+                        "The selected folder provider cannot rename the completed "
+                        f"temporary file to {filename!r}."
+                    )
+                temporary_uri = None
+
         except Exception as write_error:
-            if temporary_uri is not None:
-                try:
-                    self.DocumentsContract.deleteDocument(self.resolver, temporary_uri)
-                except Exception:
-                    pass
+            for partial_uri in (temporary_uri, output_uri):
+                if partial_uri is not None:
+                    try:
+                        self.DocumentsContract.deleteDocument(self.resolver, partial_uri)
+                    except Exception:
+                        pass
             if backup_uri is not None:
                 try:
                     restored = self.DocumentsContract.renameDocument(
@@ -378,8 +392,7 @@ class AndroidStorage:
             try:
                 self.DocumentsContract.deleteDocument(self.resolver, backup_uri)
             except Exception:
-                # New file is valid; keep the hidden backup rather than fail
-                # the completed export or risk removing the new file.
+                # The new output is complete; keep the backup if cleanup is unsupported.
                 pass
 
     def export_directory_if_needed(self, local_directory):
