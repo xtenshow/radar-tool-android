@@ -110,7 +110,7 @@ jobs:
           source = build_file.read_text(encoding="utf-8")
           old = """        shprint(host_python, '-m', 'venv', 'venv')
 
-                # Prepare base environment and upgrade pip:
+        # Prepare base environment and upgrade pip:
                 base_env = dict(copy.copy(os.environ))
                 base_env["PYTHONPATH"] = ctx.get_site_packages_dir(arch)
                 info('Upgrade pip to latest version')
@@ -120,7 +120,7 @@ jobs:
           """
           new = """        shprint(host_python, '-m', 'venv', '--clear', 'venv')
 
-                # Prepare base environment:
+        # Prepare base environment:
                 base_env = dict(copy.copy(os.environ))
                 base_env["PYTHONPATH"] = ctx.get_site_packages_dir(arch)
           """
