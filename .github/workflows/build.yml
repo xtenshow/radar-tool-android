@@ -133,12 +133,12 @@ jobs:
           apk_path = sys.argv[1]
           with zipfile.ZipFile(apk_path) as archive:
               names = archive.namelist()
-          required = ("arm64-v8a", "x86_64")
+          required = ("arm64-v8a", "armeabi-v7a", "x86_64", "x86")
           for abi in required:
               prefix = "lib/" + abi + "/"
               if not any(name.startswith(prefix) for name in names):
                   raise SystemExit("APK is missing native libraries for " + abi)
-          print("APK contains ARM64 and x86_64 native libraries:", apk_path)
+          print("APK contains ARM64, ARM32, x86_64 and x86 native libraries:", apk_path)
           PY
           aapt="$(find "$ANDROIDSDK/build-tools" -type f -name aapt | sort -V | tail -n 1)"
           test -n "$aapt"
@@ -146,6 +146,51 @@ jobs:
           apksigner="$(find "$ANDROIDSDK/build-tools" -type f -name apksigner | sort -V | tail -n 1)"
           test -n "$apksigner"
           "$apksigner" verify --verbose "$apk"
+
+
+      - name: Install and launch APK on x86_64 Android Emulator
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk_root="\${ANDROID_SDK_ROOT:-$HOME/.buildozer/android/platform/android-sdk}"
+          sdkmanager="$(find "$sdk_root/cmdline-tools" -type f -name sdkmanager | sort -V | tail -n 1)"
+          avdmanager="$(find "$sdk_root/cmdline-tools" -type f -name avdmanager | sort -V | tail -n 1)"
+          test -n "$sdkmanager"
+          test -n "$avdmanager"
+          yes | "$sdkmanager" --sdk_root="$sdk_root" --licenses >/dev/null || true
+          "$sdkmanager" --sdk_root="$sdk_root" "emulator" "platform-tools" "system-images;android-33;google_apis;x86_64"
+          echo "no" | "$avdmanager" create avd \
+            --force --name radar-x86_64 \
+            --package "system-images;android-33;google_apis;x86_64" \
+            --device "pixel_2"
+          "$sdk_root/emulator/emulator" \
+            -avd radar-x86_64 -no-window -no-audio -no-boot-anim \
+            -gpu swiftshader_indirect -accel off \
+            >"$RUNNER_TEMP/radar-emulator.log" 2>&1 &
+          adb="$sdk_root/platform-tools/adb"
+          "$adb" wait-for-device
+          booted=false
+          for attempt in $(seq 1 60); do
+            if [[ "$("$adb" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" == "1" ]]; then
+              booted=true
+              break
+            fi
+            sleep 5
+          done
+          if [[ "$booted" != "true" ]]; then
+            cat "$RUNNER_TEMP/radar-emulator.log"
+            exit 1
+          fi
+          apk="$(find bin -maxdepth 1 -type f -name '*.apk' -print -quit)"
+          "$adb" install "$apk"
+          "$adb" shell monkey -p org.tenshorecords.radartool 1
+          sleep 15
+          if ! "$adb" shell pidof org.tenshorecords.radartool >/dev/null 2>&1; then
+            "$adb" logcat -d -t 250 | grep -E "AndroidRuntime|python|SDL|FATAL" || true
+            cat "$RUNNER_TEMP/radar-emulator.log"
+            exit 1
+          fi
+          echo "APK installed and launched successfully on Android 13 x86_64."
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
