@@ -19,7 +19,7 @@ android.accept_sdk_license = True
 android.numeric_version = 2
 android.debug_artifact = apk
 android.release_artifact = apk
-android.archs = arm64-v8a, x86_64
+android.archs = arm64-v8a, armeabi-v7a, x86_64, x86
 p4a.branch = v2026.05.09
 
 [buildozer]
