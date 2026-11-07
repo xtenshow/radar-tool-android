@@ -36,9 +36,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          branch_name="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
           previous_runs="$(gh run list \
             --repo "$GITHUB_REPOSITORY" \
             --workflow build.yml \
+            --branch "$branch_name" \
             --limit 100 \
             --json databaseId,status \
             --jq ".[] | select(.status == \"queued\" or .status == \"in_progress\") | select(.databaseId != $GITHUB_RUN_ID) | .databaseId")"
@@ -68,7 +70,10 @@ jobs:
           pip install buildozer==1.5.0 Cython==0.29.36
 
       - name: Validate Python syntax
-        run: python -m compileall -q main.py android_storage.py
+        run: python -m compileall -q main.py android_storage.py operation_history.py file_transactions.py tests
+
+      - name: Run safety and persistence tests
+        run: python -m unittest discover -s tests -v
 
       - name: Package source archive
         run: |
@@ -82,9 +87,65 @@ jobs:
           path: ${{ runner.temp }}/RadarTool-Android-Source.zip
           if-no-files-found: error
 
+      - name: Configure stable Android signing (optional)
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${ANDROID_KEYSTORE_BASE64:-}" && -n "${ANDROID_KEYSTORE_PASSWORD:-}" && -n "${ANDROID_KEY_ALIAS:-}" && -n "${ANDROID_KEY_PASSWORD:-}" ]]; then
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/radartool-release.keystore"
+            test -s "$RUNNER_TEMP/radartool-release.keystore"
+            {
+              echo "P4A_RELEASE_KEYSTORE=$RUNNER_TEMP/radartool-release.keystore"
+              echo "P4A_RELEASE_KEYSTORE_PASSWD=$ANDROID_KEYSTORE_PASSWORD"
+              echo "P4A_RELEASE_KEYALIAS=$ANDROID_KEY_ALIAS"
+              echo "P4A_RELEASE_KEYALIAS_PASSWD=$ANDROID_KEY_PASSWORD"
+              echo "RADAR_RELEASE_SIGNING=true"
+            } >> "$GITHUB_ENV"
+            echo "Stable release signing is configured."
+          else
+            echo "Release signing secrets are incomplete; building a debug APK."
+            echo "RADAR_RELEASE_SIGNING=false" >> "$GITHUB_ENV"
+          fi
+
       - name: Build APK with Buildozer
         run: |
-          buildozer android debug
+          if [[ "${RADAR_RELEASE_SIGNING:-false}" == "true" ]]; then
+            buildozer android release
+          else
+            buildozer android debug
+          fi
+
+      - name: Verify APK package and emulator ABIs
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk="$(find bin -maxdepth 1 -type f -name '*.apk' -print -quit)"
+          test -n "$apk"
+          python - "$apk" <<'PY'
+          import sys
+          import zipfile
+
+          apk_path = sys.argv[1]
+          with zipfile.ZipFile(apk_path) as archive:
+              names = archive.namelist()
+          required = ("arm64-v8a", "x86_64")
+          for abi in required:
+              prefix = "lib/" + abi + "/"
+              if not any(name.startswith(prefix) for name in names):
+                  raise SystemExit("APK is missing native libraries for " + abi)
+          print("APK contains ARM64 and x86_64 native libraries:", apk_path)
+          PY
+          aapt="$(find "$ANDROIDSDK/build-tools" -type f -name aapt | sort -V | tail -n 1)"
+          test -n "$aapt"
+          "$aapt" dump badging "$apk" | grep -F "package: name='org.tenshorecords.radartool' versionCode='2' versionName='1.1.0'"
+          apksigner="$(find "$ANDROIDSDK/build-tools" -type f -name apksigner | sort -V | tail -n 1)"
+          test -n "$apksigner"
+          "$apksigner" verify --verbose "$apk"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
