@@ -313,8 +313,14 @@ class BaseToolItem(Screen):
         input_path = context.get("input_path", "")
         output_path = context.get("output_path", "")
         if storage is not None:
-            input_path = storage.describe_path(input_path)
-            output_path = storage.describe_path(output_path)
+            try:
+                input_path = storage.describe_path(input_path)
+            except Exception:
+                input_path = str(input_path or "")
+            try:
+                output_path = storage.describe_path(output_path)
+            except Exception:
+                output_path = str(output_path or "")
         try:
             self.app_ref.history.add(
                 context.get("title", "Operation"),
@@ -992,6 +998,7 @@ class ColorItem(BaseToolItem):
         self.replace_rgb = (255, 0, 0)
         self.tolerance = 40
         self._preview_event = None
+        self._image_load_token = 0
         self._build()
 
     def _build(self):
@@ -1114,30 +1121,51 @@ class ColorItem(BaseToolItem):
                   app_ref=self.app_ref)
 
     def _on_image(self, path):
+        self._image_load_token += 1
+        token = self._image_load_token
         self.app_ref.set_status("Loading image...", YELLOW)
+        try:
+            threading.Thread(
+                target=self._load_image_worker,
+                args=(path, token),
+                daemon=True,
+            ).start()
+        except Exception as exc:
+            self._image_load_failed(token, exc)
+
+    def _load_image_worker(self, path, token):
         try:
             with Image.open(path) as source:
                 if source.width * source.height > MAX_PROCESS_PIXELS:
                     raise ValueError("Image exceeds the safe 12-megapixel processing limit.")
                 loaded_image = source.convert("RGBA")
-            self.image_path = path
-            self.pil_image = loaded_image
-            self._img_path_label.text = truncate_path(path)
-            self._img_path_label.text_color = hex_rgba(PRIMARY)
-
-            preview = self.pil_image.copy()
+            preview = loaded_image.copy()
             preview.thumbnail((400, 400), Image.LANCZOS)
-            self.preview_src = preview
-            self._orig_image.texture = pil_to_texture(preview)
-
-            # initial live preview with current settings
-            self._schedule_preview()
-            self.app_ref.set_status(
-                f"Loaded {os.path.basename(path)}", GREEN)
+            self._image_load_succeeded(path, token, loaded_image, preview)
         except Exception as exc:
-            self.app_ref.set_status("Load failed", RED)
-            self.app_ref.show_dialog(
-                "Error", f"Could not open image:\n{exc}")
+            self._image_load_failed(token, exc)
+
+    @mainthread
+    def _image_load_succeeded(self, path, token, loaded_image, preview):
+        if token != self._image_load_token:
+            return
+        self.image_path = path
+        self.pil_image = loaded_image
+        self.preview_src = preview
+        self._img_path_label.text = truncate_path(path)
+        self._img_path_label.text_color = hex_rgba(PRIMARY)
+        self._orig_image.texture = pil_to_texture(preview)
+        self._schedule_preview()
+        self.app_ref.set_status(
+            f"Loaded {os.path.basename(path)}", GREEN)
+
+    @mainthread
+    def _image_load_failed(self, token, exc):
+        if token != self._image_load_token:
+            return
+        self.app_ref.set_status("Load failed", RED)
+        self.app_ref.show_dialog(
+            "Error", f"Could not open image:\n{exc}")
 
     def _tap_original(self, instance, touch):
         if self.preview_src is None:
