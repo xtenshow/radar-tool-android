@@ -29,6 +29,14 @@ class TilePositionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             tile_position(0, 0, 256)
 
+    def test_all_144_positions_are_unique_and_cover_same_grid_when_flipped(self):
+        normal = {tile_position(i, 10, 20) for i in range(144)}
+        flipped = {tile_position(i, 10, 20, True) for i in range(144)}
+        expected = {(x * 10, y * 20) for y in range(12) for x in range(12)}
+        self.assertEqual(len(normal), 144)
+        self.assertEqual(normal, expected)
+        self.assertEqual(flipped, expected)
+
 
 class RecolorTests(unittest.TestCase):
     def test_replaces_matching_color_and_preserves_alpha(self):
