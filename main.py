@@ -937,6 +937,11 @@ class TxDItem(BaseToolItem):
                                 raise ValueError("Image exceeds the safe 12-megapixel processing limit.")
                             data = make_txd(name, source)
                         output_name = name + ".txd"
+                        if output_name in generated:
+                            raise ValueError(
+                                "Duplicate output name from multiple PNG files: "
+                                + output_name
+                            )
                         with open(os.path.join(staging_dir, output_name), "wb") as target:
                             target.write(data)
                         generated.append(output_name)
