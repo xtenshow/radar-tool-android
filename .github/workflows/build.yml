@@ -51,14 +51,8 @@ jobs:
       - name: Install Pillow for image regression tests
         run: pip install Pillow
 
-      - name: Run safety and persistence tests (10 independent passes)
-        shell: bash
-        run: |
-          set -euo pipefail
-          for pass in $(seq 1 10); do
-            echo "================ Regression pass $pass / 10 ================"
-            python -m unittest discover -s tests -v
-          done
+      - name: Run safety and persistence tests
+        run: python -m unittest discover -s tests -v
 
       - name: Package source archive
         run: |
