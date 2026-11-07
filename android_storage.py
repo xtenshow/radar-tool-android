@@ -442,5 +442,6 @@ class AndroidStorage:
             return os.path.basename(local_path)
         display_name = self._display_name(uri) or os.path.basename(local_path)
         self._copy_file_to_uri(uri, local_path)
-        self._output_files.pop(key, None)
+        # Keep this short-lived URI mapping until the operation history has
+        # captured the real SAF destination instead of the private temp path.
         return display_name
