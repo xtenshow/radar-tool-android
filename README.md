@@ -19,8 +19,8 @@ configured BlueStacks 64-bit instances. The CI job checks all four ABI library f
 on an Android 13 x86_64 emulator before uploading it.
 
 The Android application ID remains `org.tenshorecords.radartool`; the version
-is now `1.1.0` with version code `2`. Keep the application ID unchanged and
-increase the version code for every future update.
+is now `1.1.0` with version code `102611000`. Keep the application ID unchanged and
+increase `android.numeric_version` above `102611000` for every future update.
 
 ### Stable signing is required for seamless updates
 
