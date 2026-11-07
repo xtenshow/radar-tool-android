@@ -4,7 +4,6 @@ Complete implementation — Merge / Split / TXD / Color Studio
 """
 
 import os
-import struct
 import threading
 import colorsys
 import tempfile
@@ -39,6 +38,7 @@ from plyer import filechooser
 from android_storage import AndroidStorage
 from operation_history import OperationHistory
 from file_transactions import atomic_write, commit_staged_files
+from image_algorithms import make_txd, tile_position, recolor_image
 
 try:
     from android.permissions import request_permissions, Permission
@@ -53,6 +53,7 @@ except ImportError:
 DEFAULT_TILE_SIZE = 256
 GRID_SIZE = 12
 TOTAL_TILES = GRID_SIZE * GRID_SIZE
+MAX_PROCESS_PIXELS = 12_000_000
 
 BG_DEEP       = "#07080d"
 BG_SIDEBAR    = "#0b0c12"
@@ -185,84 +186,7 @@ def pick_save_file(on_pick, app_ref=None, default_name="recolored.png"):
         _picker_error(app_ref, "Save picker error", exc)
 
 
-# ============================================================================
-#  TXD BINARY (identical to desktop v8)
-# ============================================================================
-def _rw_section(section_type, data):
-    return struct.pack("<III", section_type, len(data), RW_VERSION) + data
-
-
-def make_txd(texture_name, image):
-    img = image.convert("RGBA")
-    r, g, b, a = img.split()
-    pixel_data = Image.merge("RGBA", (b, g, r, a)).tobytes()
-    w, h = img.size
-    name_bytes = texture_name.encode("ascii")[:31].ljust(32, b"\x00")
-    alpha_bytes = b"\x00" * 32
-
-    native = (
-        struct.pack("<II", PLATFORM_D3D9, FILTER_FLAGS)
-        + name_bytes + alpha_bytes
-        + struct.pack("<IIHHBBBBI",
-                      RASTER_FORMAT, D3DFMT_A8R8G8B8, w, h,
-                      DEPTH, MIPMAP_COUNT, TEX_TYPE, D3D9_FLAGS,
-                      len(pixel_data))
-        + pixel_data
-    )
-    tex_native = _rw_section(
-        SECTION_TEX_NATIVE,
-        _rw_section(SECTION_STRUCT, native)
-        + _rw_section(SECTION_EXTENSION, b"")
-    )
-    return _rw_section(
-        SECTION_TEX_DICT,
-        _rw_section(SECTION_STRUCT, struct.pack("<HH", 1, 2))
-        + tex_native
-        + _rw_section(SECTION_EXTENSION, b"")
-    )
-
-
-# ============================================================================
-#  IMAGE ALGORITHMS (preserved from desktop v8)
-# ============================================================================
-def tile_position(index, tw, th, flip):
-    col = index % GRID_SIZE
-    row = index // GRID_SIZE
-    if flip:
-        row = GRID_SIZE - 1 - row
-    return col * tw, row * th
-
-
-def recolor_image(image, target_rgb, replace_rgb, tolerance):
-    img = image.convert("RGBA")
-    tr, tg, tb = target_rgb
-    rr, rg, rb = replace_rgb
-    dr, dg, db = (rr - tr), (rg - tg), (rb - tb)
-    tol = max(1.0, float(tolerance))
-
-    src = img.getdata()
-    out = [None] * len(src)
-    for i, (r, g, b, a) in enumerate(src):
-        diff_r, diff_g, diff_b = r - tr, g - tg, b - tb
-        dist = (diff_r * diff_r + diff_g * diff_g + diff_b * diff_b) ** 0.5
-        mask = 1.0 - (dist / tol)
-        if mask <= 0.0:
-            out[i] = (r, g, b, a)
-            continue
-        if mask > 1.0:
-            mask = 1.0
-        nr = r + dr * mask
-        ng = g + dg * mask
-        nb = b + db * mask
-        out[i] = (
-            0 if nr < 0 else (255 if nr > 255 else int(round(nr))),
-            0 if ng < 0 else (255 if ng > 255 else int(round(ng))),
-            0 if nb < 0 else (255 if nb > 255 else int(round(nb))),
-            a,
-        )
-    result = Image.new("RGBA", img.size)
-    result.putdata(out)
-    return result
+# Image, tile and TXD algorithms are imported from image_algorithms.py.
 
 
 # ============================================================================
@@ -652,9 +576,11 @@ class MergeItem(BaseToolItem):
             th = int(self.tile_h.text)
             if tw <= 0 or th <= 0:
                 raise ValueError
-        except ValueError:
+            if tw * GRID_SIZE * th * GRID_SIZE > MAX_PROCESS_PIXELS:
+                raise ValueError("The merged map would exceed the safe 12-megapixel processing limit.")
+        except ValueError as exc:
             return self.app_ref.show_dialog(
-                "Error", "Tile size must be positive integers.")
+                "Error", str(exc) or "Tile size must be positive integers.")
         if not self._begin_operation(
             "Merged 144 radar tiles", self.input_folder, self.output_folder
         ):
@@ -692,6 +618,8 @@ class MergeItem(BaseToolItem):
             for i in range(TOTAL_TILES):
                 p = os.path.join(in_dir, f"radar{i:02}.png")
                 with Image.open(p) as source:
+                    if source.width * source.height > MAX_PROCESS_PIXELS:
+                        raise ValueError(f"{os.path.basename(p)} exceeds the safe image size limit.")
                     img = source.convert("RGBA")
                 if img.size != (tw, th):
                     img = img.resize((tw, th), Image.LANCZOS)
@@ -824,9 +752,11 @@ class SplitItem(BaseToolItem):
             th = int(self.tile_h.text)
             if tw <= 0 or th <= 0:
                 raise ValueError
-        except ValueError:
+            if tw * GRID_SIZE * th * GRID_SIZE > MAX_PROCESS_PIXELS:
+                raise ValueError("The split map would exceed the safe 12-megapixel processing limit.")
+        except ValueError as exc:
             return self.app_ref.show_dialog(
-                "Error", "Tile size must be positive integers.")
+                "Error", str(exc) or "Tile size must be positive integers.")
         if not self._begin_operation(
             "Split map into 144 tiles", self.image_path, self.output_folder
         ):
@@ -846,6 +776,8 @@ class SplitItem(BaseToolItem):
     def _worker(self, img_path, out_dir, tw, th, flip):
         try:
             with Image.open(img_path) as source:
+                if source.width * source.height > MAX_PROCESS_PIXELS:
+                    raise ValueError("The selected map image exceeds the safe 12-megapixel processing limit.")
                 img = source.convert("RGBA")
             target = (tw * GRID_SIZE, th * GRID_SIZE)
             if img.size != target:
@@ -995,6 +927,8 @@ class TxDItem(BaseToolItem):
                     try:
                         name = os.path.splitext(filename)[0]
                         with Image.open(os.path.join(input_folder, filename)) as source:
+                            if source.width * source.height > MAX_PROCESS_PIXELS:
+                                raise ValueError("Image exceeds the safe 12-megapixel processing limit.")
                             data = make_txd(name, source)
                         output_name = name + ".txd"
                         with open(os.path.join(staging_dir, output_name), "wb") as target:
@@ -1183,6 +1117,8 @@ class ColorItem(BaseToolItem):
         self.app_ref.set_status("Loading image...", YELLOW)
         try:
             with Image.open(path) as source:
+                if source.width * source.height > MAX_PROCESS_PIXELS:
+                    raise ValueError("Image exceeds the safe 12-megapixel processing limit.")
                 loaded_image = source.convert("RGBA")
             self.image_path = path
             self.pil_image = loaded_image
