@@ -156,7 +156,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sdk_root="\${ANDROID_SDK_ROOT:-$HOME/.buildozer/android/platform/android-sdk}"
+          sdk_root="${ANDROID_SDK_ROOT:-${ANDROIDSDK:-$HOME/.buildozer/android/platform/android-sdk}}"
           sdkmanager="$(find "$sdk_root/cmdline-tools" -type f -name sdkmanager | sort -V | tail -n 1)"
           avdmanager="$(find "$sdk_root/cmdline-tools" -type f -name avdmanager | sort -V | tail -n 1)"
           test -n "$sdkmanager"
