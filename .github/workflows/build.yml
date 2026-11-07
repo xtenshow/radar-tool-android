@@ -119,14 +119,15 @@ jobs:
           if old_block.count("pip install -U pip") != 1:
               raise SystemExit("Expected exactly one pip self-upgrade in p4a build.py")
 
-          new_block = (
-              "        shprint(host_python, '-m', 'venv', '--clear', 'venv')\\n"
-              "\\n"
-              "        # Prepare base environment:\\n"
-              "        base_env = dict(copy.copy(os.environ))\\n"
-              "        base_env[\\"PYTHONPATH\\"] = ctx.get_site_packages_dir(arch)\\n"
-              "\\n"
-          )
+          newline = chr(10)
+          new_block = newline.join([
+              "        shprint(host_python, '-m', 'venv', '--clear', 'venv')",
+              "",
+              "        # Prepare base environment:",
+              "        base_env = dict(copy.copy(os.environ))",
+              '        base_env["PYTHONPATH"] = ctx.get_site_packages_dir(arch)',
+              "",
+          ])
           source = source[:start] + new_block + source[end:]
           build_file.write_text(source, encoding="utf-8")
 
