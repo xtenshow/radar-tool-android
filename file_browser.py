@@ -74,13 +74,16 @@ class InternalFileBrowser(ModalView):
         header.add_widget(close_button)
         root.add_widget(header)
 
+        path_row = BoxLayout(size_hint_y=None, height=dp(38), spacing=dp(8))
+        self.up_button = self._button("‹ Up", self._go_up, width=dp(64))
+        path_row.add_widget(self.up_button)
         self.path_label = Label(
             text="Checking storage access…", color=MUTED,
-            size_hint_y=None, height=dp(34),
             halign="left", valign="middle",
         )
         self.path_label.bind(size=lambda w, *_: setattr(w, "text_size", w.size))
-        root.add_widget(self.path_label)
+        path_row.add_widget(self.path_label)
+        root.add_widget(path_row)
 
         self.search = TextInput(
             hint_text="Search this folder",
@@ -165,9 +168,11 @@ class InternalFileBrowser(ModalView):
             self.rows.clear_widgets()
             self.path_label.text = "Storage access has not been granted"
             self.status_label.text = "Grant one folder once; browsing then stays inside this app."
-            self.rows.add_widget(
-                self._button("Grant folder access", self._grant_root, accent=True)
-            )
+            grant_button = self._button(
+                "Grant folder access", self._grant_root, accent=True)
+            grant_button.size_hint_y = None
+            grant_button.height = dp(48)
+            self.rows.add_widget(grant_button)
 
     def _grant_root(self):
         self.status_label.text = "Waiting for Android folder permission…"
@@ -181,12 +186,19 @@ class InternalFileBrowser(ModalView):
         self.search.text = ""
         self._refresh()
 
+    def _go_up(self):
+        if len(self._stack) > 1:
+            self._stack.pop()
+            self.search.text = ""
+            self._refresh()
+
     def _refresh(self):
         if self._busy or not self._stack:
             return
         self._busy = True
         document_id, folder_name = self._stack[-1]
         self.path_label.text = " / ".join(name for _, name in self._stack)
+        self.up_button.disabled = len(self._stack) <= 1
         self.status_label.text = "Loading folder…"
 
         def worker():
@@ -286,7 +298,9 @@ class InternalFileBrowser(ModalView):
             try:
                 operation(complete)
             except Exception as exc:
-                Clock.schedule_once(lambda _dt: self._selection_error(str(exc)), 0)
+                message = str(exc)
+                Clock.schedule_once(
+                    lambda _dt, text=message: self._selection_error(text), 0)
 
         threading.Thread(target=worker, daemon=True).start()
 
