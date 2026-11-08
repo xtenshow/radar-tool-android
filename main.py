@@ -8,7 +8,7 @@ import struct
 import threading
 import colorsys
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 from kivy.clock import Clock, mainthread
 from kivy.graphics import Color, RoundedRectangle, Rectangle
@@ -891,6 +891,8 @@ class ColorItem(BaseToolItem):
         self.replace_rgb = (255, 0, 0)
         self.tolerance = 40
         self._preview_event = None
+        self._image_load_generation = 0
+        self._preview_generation = 0
         self._build()
 
     def _build(self):
@@ -1013,26 +1015,51 @@ class ColorItem(BaseToolItem):
                   app_ref=self.app_ref)
 
     def _on_image(self, path):
+        # Decoding and thumbnail generation can be expensive for large radar
+        # maps. Keep both off the Kivy UI thread.
+        self._image_load_generation += 1
+        generation = self._image_load_generation
         self.app_ref.set_status("Loading image...", YELLOW)
-        try:
-            self.image_path = path
-            self.pil_image = Image.open(path).convert("RGBA")
-            self._img_path_label.text = truncate_path(path)
-            self._img_path_label.text_color = hex_rgba(PRIMARY)
 
-            preview = self.pil_image.copy()
-            preview.thumbnail((400, 400), Image.LANCZOS)
-            self.preview_src = preview
-            self._orig_image.texture = pil_to_texture(preview)
+        def worker():
+            try:
+                with Image.open(path) as source:
+                    full_image = ImageOps.exif_transpose(source).convert("RGBA")
+                preview = full_image.copy()
+                preview.thumbnail((512, 512), Image.LANCZOS)
+                error = None
+            except Exception as exc:
+                full_image = None
+                preview = None
+                error = str(exc)
 
-            # initial live preview with current settings
-            self._schedule_preview()
-            self.app_ref.set_status(
-                f"Loaded {os.path.basename(path)}", GREEN)
-        except Exception as exc:
+            Clock.schedule_once(
+                lambda _dt: self._finish_image_load(
+                    path, full_image, preview, error, generation),
+                0,
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_image_load(self, path, full_image, preview, error, generation):
+        if generation != self._image_load_generation:
+            return
+        if error:
             self.app_ref.set_status("Load failed", RED)
-            self.app_ref.show_dialog(
-                "Error", f"Could not open image:\n{exc}")
+            self.app_ref.show_dialog("Error", f"Could not open image:\n{error}")
+            return
+
+        self.image_path = path
+        self.pil_image = full_image
+        self.preview_src = preview
+        self._img_path_label.text = truncate_path(path)
+        self._img_path_label.text_color = hex_rgba(PRIMARY)
+        self._orig_image.texture = pil_to_texture(preview)
+        self._schedule_preview()
+        self.app_ref.set_status(
+            f"Loaded {os.path.basename(path)} ({full_image.width}x{full_image.height})",
+            GREEN,
+        )
 
     def _tap_original(self, instance, touch):
         if self.preview_src is None:
@@ -1205,19 +1232,40 @@ class ColorItem(BaseToolItem):
     def _schedule_preview(self):
         if self._preview_event is not None:
             self._preview_event.cancel()
-        self._preview_event = Clock.schedule_once(self._update_preview, 0.2)
+        self._preview_generation += 1
+        generation = self._preview_generation
+        self._preview_event = Clock.schedule_once(
+            lambda dt: self._start_preview(generation), 0.16)
 
-    @mainthread
-    def _update_preview(self, dt):
+    def _start_preview(self, generation):
         self._preview_event = None
         if self.preview_src is None:
             return
-        try:
-            result = recolor_image(self.preview_src, self.target_rgb,
-                                   self.replace_rgb, self.tolerance)
-            self._live_image.texture = pil_to_texture(result)
-        except Exception:
-            pass
+
+        # Snapshot inputs so a worker never reads mutable UI state.
+        source = self.preview_src.copy()
+        target_rgb = tuple(self.target_rgb)
+        replace_rgb = tuple(self.replace_rgb)
+        tolerance = int(self.tolerance)
+
+        def worker():
+            try:
+                result = recolor_image(
+                    source, target_rgb, replace_rgb, tolerance)
+                Clock.schedule_once(
+                    lambda _dt: self._apply_preview(result, generation), 0)
+            except Exception as exc:
+                Clock.schedule_once(
+                    lambda _dt: self.app_ref.set_status(
+                        f"Preview failed: {str(exc)[:100]}", RED), 0)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_preview(self, result, generation):
+        # Discard stale results from earlier slider movements or image loads.
+        if generation != self._preview_generation or self.preview_src is None:
+            return
+        self._live_image.texture = pil_to_texture(result)
 
     # -- save ----------------------------------------------------------
     def _save(self):
