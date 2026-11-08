@@ -208,6 +208,8 @@ class AndroidStorage:
         if request is None:
             return
         if int(result_code) != self.RESULT_OK or intent is None:
+            if request.get("kind") == "browser_root":
+                request["callback"](False)
             return
         try:
             uri = intent.getData()
@@ -361,17 +363,12 @@ class AndroidStorage:
             self._write_stream_to_uri(uri, source)
 
     def _delete_existing_child(self, tree_uri, name, parent_document_id=None):
-        for doc_id, existing_name, _mime_type in self._list_children(
+        for _doc_id, existing_name, _mime_type in self._list_children(
                 tree_uri, parent_document_id):
-            if existing_name == name:
-                existing_uri = self.DocumentsContract.buildDocumentUriUsingTree(
-                    tree_uri, doc_id)
-                deleted = self.DocumentsContract.deleteDocument(
-                    self.resolver, existing_uri)
-                if not deleted:
-                    raise RuntimeError(
-                        f"Cannot replace existing file {name!r} in the selected folder.")
-                return
+            if existing_name.casefold() == name.casefold():
+                raise FileExistsError(
+                    f"{name!r} already exists in the selected folder. "
+                    "Choose an empty folder or rename the output.")
 
     def _write_file_to_tree(
             self, tree_uri, local_path, parent_document_id=None):
@@ -406,6 +403,25 @@ class AndroidStorage:
         # its more specific conversion errors instead of masking them here.
         if not files:
             return 0
+
+        # Check all name collisions before writing the first output file. This
+        # prevents a batch export from silently replacing user data or leaving
+        # a partially updated set when a collision is discovered late.
+        existing_names = {
+            name.casefold()
+            for _doc_id, name, _mime in self._list_children(
+                tree_uri, parent_document_id)
+        }
+        collisions = [
+            os.path.basename(path) for path in files
+            if os.path.basename(path).casefold() in existing_names
+        ]
+        if collisions:
+            sample = ", ".join(collisions[:8])
+            raise FileExistsError(
+                f"{len(collisions)} output file(s) already exist: {sample}. "
+                "Choose an empty folder or rename the outputs.")
+
         for path in files:
             self._write_file_to_tree(tree_uri, path, parent_document_id)
         return len(files)
