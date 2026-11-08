@@ -1255,9 +1255,10 @@ class ColorItem(BaseToolItem):
                 Clock.schedule_once(
                     lambda _dt: self._apply_preview(result, generation), 0)
             except Exception as exc:
+                message = str(exc)[:100]
                 Clock.schedule_once(
-                    lambda _dt: self.app_ref.set_status(
-                        f"Preview failed: {str(exc)[:100]}", RED), 0)
+                    lambda _dt, text=message: self.app_ref.set_status(
+                        f"Preview failed: {text}", RED), 0)
 
         threading.Thread(target=worker, daemon=True).start()
 
