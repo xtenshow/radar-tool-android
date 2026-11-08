@@ -36,6 +36,7 @@ from kivymd.uix.dialog import (
 
 from plyer import filechooser
 from android_storage import AndroidStorage
+from file_browser import InternalFileBrowser
 
 try:
     from android.permissions import request_permissions, Permission
@@ -123,7 +124,9 @@ def pick_file(on_pick, filters=None, app_ref=None):
             _picker_error(app_ref, "Android file access unavailable",
                           "The Android Storage Access Framework could not be initialized.")
             return
-        app_ref.storage.pick_file(on_pick, mime_type="image/*")
+        InternalFileBrowser(
+            app_ref, mode="file", callback=on_pick
+        ).open()
         return
 
     def cb(selection):
@@ -142,7 +145,11 @@ def pick_dir(on_pick, app_ref=None, output=False):
             _picker_error(app_ref, "Android folder access unavailable",
                           "The Android Storage Access Framework could not be initialized.")
             return
-        app_ref.storage.pick_directory(output=output, callback=on_pick)
+        InternalFileBrowser(
+            app_ref,
+            mode="output_dir" if output else "input_dir",
+            callback=on_pick,
+        ).open()
         return
 
     def cb(selection):
@@ -161,7 +168,12 @@ def pick_save_file(on_pick, app_ref=None, default_name="recolored.png"):
             _picker_error(app_ref, "Android save unavailable",
                           "The Android Storage Access Framework could not be initialized.")
             return
-        app_ref.storage.pick_save_file(on_pick, default_name=default_name)
+        InternalFileBrowser(
+            app_ref,
+            mode="save_file",
+            callback=on_pick,
+            default_name=default_name,
+        ).open()
         return
 
     def cb(selection):
