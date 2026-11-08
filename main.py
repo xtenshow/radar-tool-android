@@ -1350,6 +1350,35 @@ class RadarApp(MDApp):
 
         return root
 
+    def on_start(self):
+        # Hide only Android's system navigation controls. Keep the status bar
+        # visible and let Android reveal the navigation bar transiently on swipe.
+        Clock.schedule_once(lambda _dt: self._apply_immersive_navigation(), 0.35)
+
+    def on_resume(self):
+        # Activities such as document providers can restore system UI flags
+        # when they return control to the app.
+        Clock.schedule_once(lambda _dt: self._apply_immersive_navigation(), 0.25)
+
+    def _apply_immersive_navigation(self):
+        if not ANDROID:
+            return
+        try:
+            from jnius import autoclass
+            activity = autoclass("org.kivy.android.PythonActivity").mActivity
+            view = autoclass("android.view.View")
+            flags = (
+                view.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                | view.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                | view.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                | view.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+            )
+            activity.getWindow().getDecorView().setSystemUiVisibility(flags)
+        except Exception as exc:
+            # Do not crash startup if a vendor ROM does not accept the flags.
+            self.set_status("System navigation could not be hidden", YELLOW)
+            print("Immersive navigation setup failed:", exc)
+
     def set_status(self, text, color=GREEN):
         self._status_label.text = text
         self._status_dot.text_color = hex_rgba(color)
