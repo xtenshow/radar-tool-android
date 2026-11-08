@@ -85,6 +85,15 @@ jobs:
           path: ${{ runner.temp }}/RadarTool-Android-Source.zip
           if-no-files-found: error
 
+      - name: Select Java 17 for Gradle and Buildozer
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x "$JAVA_HOME_17_X64/bin/java"
+          echo "JAVA_HOME=$JAVA_HOME_17_X64" >> "$GITHUB_ENV"
+          echo "$JAVA_HOME_17_X64/bin" >> "$GITHUB_PATH"
+          "$JAVA_HOME_17_X64/bin/java" -version
+
       - name: Build APK with Buildozer
         run: |
           buildozer android debug
