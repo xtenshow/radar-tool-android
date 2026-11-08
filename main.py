@@ -559,6 +559,8 @@ class MergeItem(BaseToolItem):
                 if i % 12 == 0:
                     self._update_progress(found / TOTAL_TILES)
             canvas.save(os.path.join(out_dir, "map.png"))
+            if self.app_ref.storage is not None:
+                self.app_ref.storage.export_directory_if_needed(out_dir)
             self._done(found, tw, th)
         except Exception as e:
             self._fail(str(e))
@@ -569,16 +571,6 @@ class MergeItem(BaseToolItem):
 
     @mainthread
     def _done(self, found, tw, th):
-        try:
-            if self.app_ref.storage is not None:
-                self.app_ref.storage.export_directory_if_needed(self.output_folder)
-        except Exception as exc:
-            self.progress.value = 0
-            self.app_ref.set_status("Export failed", RED)
-            self.app_ref.show_dialog(
-                "Export failed",
-                f"map.png was generated in app storage, but could not be exported:\n{exc}")
-            return
         self.progress.value = 100
         self.app_ref.set_status(f"Merged {found} tiles -> map.png", GREEN)
         self.app_ref.show_dialog(
@@ -707,6 +699,8 @@ class SplitItem(BaseToolItem):
                     os.path.join(out_dir, f"radar{i:02}.png"))
                 if i % 12 == 0:
                     self._update_progress((i + 1) / TOTAL_TILES)
+            if self.app_ref.storage is not None:
+                self.app_ref.storage.export_directory_if_needed(out_dir)
             self._done(tw, th)
         except Exception as e:
             self._fail(str(e))
@@ -717,16 +711,6 @@ class SplitItem(BaseToolItem):
 
     @mainthread
     def _done(self, tw, th):
-        try:
-            if self.app_ref.storage is not None:
-                self.app_ref.storage.export_directory_if_needed(self.output_folder)
-        except Exception as exc:
-            self.progress.value = 0
-            self.app_ref.set_status("Export failed", RED)
-            self.app_ref.show_dialog(
-                "Export failed",
-                f"Tiles were generated in app storage, but could not be exported:\n{exc}")
-            return
         self.progress.value = 100
         self.app_ref.set_status("Exported 144 tiles", GREEN)
         self.app_ref.show_dialog(
@@ -836,6 +820,8 @@ class TxDItem(BaseToolItem):
                 except Exception as e:
                     errors.append(f"{f}: {e}")
                 self._update_progress((idx + 1) / len(files))
+            if self.app_ref.storage is not None:
+                self.app_ref.storage.export_directory_if_needed(self.output_folder)
             self._done(ok, len(errors), errors)
         except Exception as e:
             self._fail(str(e))
@@ -846,16 +832,6 @@ class TxDItem(BaseToolItem):
 
     @mainthread
     def _done(self, ok, err_count, errors):
-        try:
-            if self.app_ref.storage is not None:
-                self.app_ref.storage.export_directory_if_needed(self.output_folder)
-        except Exception as exc:
-            self.progress.value = 0
-            self.app_ref.set_status("Export failed", RED)
-            self.app_ref.show_dialog(
-                "Export failed",
-                f"TXD files were generated in app storage, but could not be exported:\n{exc}")
-            return
         self.progress.value = 100
         if err_count:
             self.app_ref.set_status(
@@ -1291,23 +1267,15 @@ class ColorItem(BaseToolItem):
             result = recolor_image(self.pil_image, self.target_rgb,
                                    self.replace_rgb, self.tolerance)
             result.save(out_path)
-            self._save_done(out_path)
+            filename = os.path.basename(out_path)
+            if self.app_ref.storage is not None:
+                filename = self.app_ref.storage.export_file_if_needed(out_path)
+            self._save_done(filename)
         except Exception as exc:
             self._save_fail(str(exc))
 
     @mainthread
-    def _save_done(self, path):
-        try:
-            filename = os.path.basename(path)
-            if self.app_ref.storage is not None:
-                filename = self.app_ref.storage.export_file_if_needed(path)
-        except Exception as exc:
-            self.app_ref.set_status("Export failed", RED)
-            self.app_ref.show_dialog(
-                "Export failed",
-                f"The image was created in app storage, but export failed:\n{exc}")
-            return
-
+    def _save_done(self, filename):
         self.app_ref.set_status(f"Saved -> {filename}", GREEN)
         self.app_ref.show_dialog(
             "Done", f"Color replaced and saved!\n{filename}")
