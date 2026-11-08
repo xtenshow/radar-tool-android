@@ -7,9 +7,9 @@ on:
   pull_request:
     branches: [ main ]
 
-# Prevent overlapping builds on the same ref.
+# Serialize all Radar Tool builds across branches. A new run replaces older runs.
 concurrency:
-  group: radar-tool-build-${{ github.ref }}
+  group: radar-tool-build-global
   cancel-in-progress: true
 
 permissions:
@@ -30,27 +30,11 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Cancel previous queued/running builds
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          previous_runs="$(gh run list \
-            --repo "$GITHUB_REPOSITORY" \
-            --workflow build.yml \
-            --limit 100 \
-            --json databaseId,status \
-            --jq ".[] | select(.status == \"queued\" or .status == \"in_progress\") | select(.databaseId != $GITHUB_RUN_ID) | .databaseId")"
-          if [ -n "$previous_runs" ]; then
-            while IFS= read -r run_id; do
-              [ -n "$run_id" ] || continue
-              echo "Cancelling previous workflow run $run_id"
-              gh run cancel "$run_id" --repo "$GITHUB_REPOSITORY"
-            done <<< "$previous_runs"
-          else
-            echo "No previous queued or running builds found."
-          fi
+      - name: Set up Java 17 for Gradle
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
 
       - name: Install system dependencies
         run: |
@@ -68,7 +52,13 @@ jobs:
           pip install buildozer==1.5.0 Cython==0.29.36
 
       - name: Validate Python syntax
-        run: python -m compileall -q main.py android_storage.py
+        run: python -m compileall -q main.py android_storage.py operation_history.py file_transactions.py image_algorithms.py tests
+
+      - name: Install Pillow for image regression tests
+        run: pip install Pillow
+
+      - name: Run safety and persistence tests
+        run: python -m unittest discover -s tests -v
 
       - name: Package source archive
         run: |
@@ -82,9 +72,126 @@ jobs:
           path: ${{ runner.temp }}/RadarTool-Android-Source.zip
           if-no-files-found: error
 
+      - name: Configure stable Android signing (optional)
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${ANDROID_KEYSTORE_BASE64:-}" && -n "${ANDROID_KEYSTORE_PASSWORD:-}" && -n "${ANDROID_KEY_ALIAS:-}" && -n "${ANDROID_KEY_PASSWORD:-}" ]]; then
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/radartool-release.keystore"
+            test -s "$RUNNER_TEMP/radartool-release.keystore"
+            {
+              echo "P4A_RELEASE_KEYSTORE=$RUNNER_TEMP/radartool-release.keystore"
+              echo "P4A_RELEASE_KEYSTORE_PASSWD=$ANDROID_KEYSTORE_PASSWORD"
+              echo "P4A_RELEASE_KEYALIAS=$ANDROID_KEY_ALIAS"
+              echo "P4A_RELEASE_KEYALIAS_PASSWD=$ANDROID_KEY_PASSWORD"
+              echo "RADAR_RELEASE_SIGNING=true"
+            } >> "$GITHUB_ENV"
+            echo "Stable release signing is configured."
+          else
+            echo "Release signing secrets are incomplete; building a debug APK."
+            echo "RADAR_RELEASE_SIGNING=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Prepare pinned python-for-android with pip venv fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          p4a_dir="$RUNNER_TEMP/python-for-android-v2026.05.09"
+          git clone --depth 1 --branch v2026.05.09 https://github.com/kivy/python-for-android.git "$p4a_dir"
+          expected="58d21141f17c889bf8585f5665921d72028f8831"
+          actual="$(git -C "$p4a_dir" rev-parse HEAD)"
+          test "$actual" = "$expected"
+
+          python - "$p4a_dir" "$GITHUB_WORKSPACE/buildozer.spec" <<'PY'
+          from pathlib import Path
+          import sys
+
+          p4a_dir = Path(sys.argv[1]).resolve()
+          build_file = p4a_dir / "pythonforandroid" / "build.py"
+          source = build_file.read_text(encoding="utf-8")
+
+          start_marker = "        shprint(host_python, '-m', 'venv', 'venv')"
+          end_marker = "        # Install Cython in case modules need it to build:"
+          if source.count(start_marker) != 1:
+              raise SystemExit("Unexpected p4a venv creation point")
+          start = source.index(start_marker)
+          end = source.index(end_marker, start)
+          old_block = source[start:end]
+          if old_block.count("pip install -U pip") != 1:
+              raise SystemExit("Expected exactly one pip self-upgrade in p4a build.py")
+
+          newline = chr(10)
+          new_block = newline.join([
+              "        shprint(host_python, '-m', 'venv', '--clear', 'venv')",
+              "",
+              "        # Prepare base environment:",
+              "        base_env = dict(copy.copy(os.environ))",
+              '        base_env["PYTHONPATH"] = ctx.get_site_packages_dir(arch)',
+              "",
+          ])
+          source = source[:start] + new_block + source[end:]
+          build_file.write_text(source, encoding="utf-8")
+
+          patched = build_file.read_text(encoding="utf-8")
+          check_start = patched.index("        shprint(host_python, '-m', 'venv', '--clear', 'venv')")
+          check_end = patched.index(end_marker, check_start)
+          patched_block = patched[check_start:check_end]
+          if "pip install -U pip" in patched_block:
+              raise SystemExit("pip self-upgrade is still present in patched block")
+          if "venv', '--clear', 'venv'" not in patched_block:
+              raise SystemExit("venv --clear patch verification failed")
+
+          spec_path = Path(sys.argv[2])
+          spec = spec_path.read_text(encoding="utf-8")
+          old_spec = "p4a.branch = v2026.05.09"
+          new_spec = f"p4a.source_dir = {p4a_dir}"
+          if spec.count(old_spec) != 1:
+              raise SystemExit("Could not safely pin p4a.source_dir in buildozer.spec")
+          spec_path.write_text(spec.replace(old_spec, new_spec), encoding="utf-8")
+          print("Pinned p4a v2026.05.09 and applied the upstream pip venv fix.")
+          PY
+
       - name: Build APK with Buildozer
         run: |
-          buildozer android debug
+          if [[ "${RADAR_RELEASE_SIGNING:-false}" == "true" ]]; then
+            buildozer android release
+          else
+            buildozer android debug
+          fi
+
+      - name: Verify APK package and emulator ABIs
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk="$(find bin -maxdepth 1 -type f -name '*.apk' -print -quit)"
+          test -n "$apk"
+          python - "$apk" <<'PY'
+          import sys
+          import zipfile
+
+          apk_path = sys.argv[1]
+          with zipfile.ZipFile(apk_path) as archive:
+              names = archive.namelist()
+          required = ("arm64-v8a", "armeabi-v7a", "x86_64", "x86")
+          for abi in required:
+              prefix = "lib/" + abi + "/"
+              if not any(name.startswith(prefix) for name in names):
+                  raise SystemExit("APK is missing native libraries for " + abi)
+          print("APK contains ARM64, ARM32, x86_64 and x86 native libraries:", apk_path)
+          PY
+          sdk_root="${ANDROID_SDK_ROOT:-${ANDROIDSDK:-$HOME/.buildozer/android/platform/android-sdk}}"
+          aapt="$(find "$sdk_root/build-tools" -type f -name aapt | sort -V | tail -n 1)"
+          test -n "$aapt"
+          "$aapt" dump badging "$apk" | grep -F "package: name='org.tenshorecords.radartool' versionCode='102611000' versionName='1.1.0'"
+          "$aapt" dump badging "$apk" | grep -F "sdkVersion:'21'"
+          apksigner="$(find "$sdk_root/build-tools" -type f -name apksigner | sort -V | tail -n 1)"
+          test -n "$apksigner"
+          "$apksigner" verify --verbose "$apk"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4

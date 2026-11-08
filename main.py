@@ -4,9 +4,9 @@ Complete implementation — Merge / Split / TXD / Color Studio
 """
 
 import os
-import struct
 import threading
 import colorsys
+import tempfile
 
 from PIL import Image
 
@@ -36,6 +36,9 @@ from kivymd.uix.dialog import (
 
 from plyer import filechooser
 from android_storage import AndroidStorage
+from operation_history import OperationHistory
+from file_transactions import atomic_write, commit_staged_files
+from image_algorithms import make_txd, tile_position, recolor_image
 
 try:
     from android.permissions import request_permissions, Permission
@@ -50,6 +53,7 @@ except ImportError:
 DEFAULT_TILE_SIZE = 256
 GRID_SIZE = 12
 TOTAL_TILES = GRID_SIZE * GRID_SIZE
+MAX_PROCESS_PIXELS = 12_000_000
 
 BG_DEEP       = "#07080d"
 BG_SIDEBAR    = "#0b0c12"
@@ -108,6 +112,14 @@ def pil_to_texture(pil_img):
     tex.blit_buffer(data, colorfmt="rgba", bufferfmt="ubyte")
     tex.flip_vertical()
     return tex
+
+
+def _safe_save_image(image, destination, image_format="PNG"):
+    """Save to a sibling temporary file so failure preserves the old output."""
+    atomic_write(
+        destination,
+        lambda temporary_path: image.save(temporary_path, format=image_format),
+    )
 
 
 def _picker_error(app_ref, title, exc):
@@ -174,84 +186,7 @@ def pick_save_file(on_pick, app_ref=None, default_name="recolored.png"):
         _picker_error(app_ref, "Save picker error", exc)
 
 
-# ============================================================================
-#  TXD BINARY (identical to desktop v8)
-# ============================================================================
-def _rw_section(section_type, data):
-    return struct.pack("<III", section_type, len(data), RW_VERSION) + data
-
-
-def make_txd(texture_name, image):
-    img = image.convert("RGBA")
-    r, g, b, a = img.split()
-    pixel_data = Image.merge("RGBA", (b, g, r, a)).tobytes()
-    w, h = img.size
-    name_bytes = texture_name.encode("ascii")[:31].ljust(32, b"\x00")
-    alpha_bytes = b"\x00" * 32
-
-    native = (
-        struct.pack("<II", PLATFORM_D3D9, FILTER_FLAGS)
-        + name_bytes + alpha_bytes
-        + struct.pack("<IIHHBBBBI",
-                      RASTER_FORMAT, D3DFMT_A8R8G8B8, w, h,
-                      DEPTH, MIPMAP_COUNT, TEX_TYPE, D3D9_FLAGS,
-                      len(pixel_data))
-        + pixel_data
-    )
-    tex_native = _rw_section(
-        SECTION_TEX_NATIVE,
-        _rw_section(SECTION_STRUCT, native)
-        + _rw_section(SECTION_EXTENSION, b"")
-    )
-    return _rw_section(
-        SECTION_TEX_DICT,
-        _rw_section(SECTION_STRUCT, struct.pack("<HH", 1, 2))
-        + tex_native
-        + _rw_section(SECTION_EXTENSION, b"")
-    )
-
-
-# ============================================================================
-#  IMAGE ALGORITHMS (preserved from desktop v8)
-# ============================================================================
-def tile_position(index, tw, th, flip):
-    col = index % GRID_SIZE
-    row = index // GRID_SIZE
-    if flip:
-        row = GRID_SIZE - 1 - row
-    return col * tw, row * th
-
-
-def recolor_image(image, target_rgb, replace_rgb, tolerance):
-    img = image.convert("RGBA")
-    tr, tg, tb = target_rgb
-    rr, rg, rb = replace_rgb
-    dr, dg, db = (rr - tr), (rg - tg), (rb - tb)
-    tol = max(1.0, float(tolerance))
-
-    src = img.getdata()
-    out = [None] * len(src)
-    for i, (r, g, b, a) in enumerate(src):
-        diff_r, diff_g, diff_b = r - tr, g - tg, b - tb
-        dist = (diff_r * diff_r + diff_g * diff_g + diff_b * diff_b) ** 0.5
-        mask = 1.0 - (dist / tol)
-        if mask <= 0.0:
-            out[i] = (r, g, b, a)
-            continue
-        if mask > 1.0:
-            mask = 1.0
-        nr = r + dr * mask
-        ng = g + dg * mask
-        nb = b + db * mask
-        out[i] = (
-            0 if nr < 0 else (255 if nr > 255 else int(round(nr))),
-            0 if ng < 0 else (255 if ng > 255 else int(round(ng))),
-            0 if nb < 0 else (255 if nb > 255 else int(round(nb))),
-            a,
-        )
-    result = Image.new("RGBA", img.size)
-    result.putdata(out)
-    return result
+# Image, tile and TXD algorithms are imported from image_algorithms.py.
 
 
 # ============================================================================
@@ -350,6 +285,59 @@ class BaseToolItem(Screen):
         self.app_ref = app_ref
         self.tab_text = text
         self.tab_icon = icon
+        self.action_button = None
+        self._operation_running = False
+        self._history_context = None
+
+    def _begin_operation(self, title, input_path="", output_path=""):
+        if self._operation_running:
+            self.app_ref.show_dialog(
+                "Operation already running",
+                "Please let the current operation finish before starting another.",
+            )
+            return False
+        self._operation_running = True
+        self._history_context = {
+            "title": title,
+            "input_path": input_path or "",
+            "output_path": output_path or "",
+        }
+        if self.action_button is not None:
+            self.action_button.disabled = True
+        return True
+
+    @mainthread
+    def _finish_operation(self, succeeded, detail=""):
+        context = self._history_context or {}
+        storage = getattr(self.app_ref, "storage", None)
+        input_path = context.get("input_path", "")
+        output_path = context.get("output_path", "")
+        if storage is not None:
+            try:
+                input_path = storage.describe_path(input_path)
+            except Exception:
+                input_path = str(input_path or "")
+            try:
+                output_path = storage.describe_path(output_path)
+            except Exception:
+                output_path = str(output_path or "")
+        try:
+            self.app_ref.history.add(
+                context.get("title", "Operation"),
+                input_path=input_path,
+                output_path=output_path,
+                status="success" if succeeded else "failed",
+                detail=detail,
+            )
+            if getattr(self.app_ref, "history_tab", None) is not None:
+                self.app_ref.history_tab.refresh()
+        except Exception:
+            # A broken history file must never interrupt the actual operation.
+            pass
+        self._history_context = None
+        self._operation_running = False
+        if self.action_button is not None:
+            self.action_button.disabled = False
 
     def _label(self, text, color=FG, size=14, bold=False, height=None):
         return MDLabel(
@@ -414,6 +402,90 @@ class BaseToolItem(Screen):
 
 
 # ============================================================================
+# OPERATION HISTORY
+# ============================================================================
+class HistoryItem(BaseToolItem):
+    def __init__(self, app_ref, **kw):
+        super().__init__(app_ref, name="history", text="History",
+                         icon="history", **kw)
+        self._build()
+
+    def _build(self):
+        content = self._make_content_root()
+        content.add_widget(self._header(
+            "Operation History",
+            "A local record of completed and failed tasks",
+        ))
+        refresh_row = MDBoxLayout(
+            orientation="horizontal",
+            size_hint_y=None,
+            height=dp(48),
+            padding=(dp(16), 0, dp(16), 0),
+        )
+        refresh_row.add_widget(Widget())
+        refresh = self._button("Refresh", self.refresh, height=40)
+        refresh.size_hint_x = None
+        refresh.width = dp(110)
+        refresh_row.add_widget(refresh)
+        content.add_widget(refresh_row)
+
+        self._history_body = MDBoxLayout(
+            orientation="vertical",
+            size_hint_y=None,
+            spacing=dp(10),
+            padding=dp(16),
+        )
+        self._history_body.bind(
+            minimum_height=self._history_body.setter("height")
+        )
+        scroll = ScrollView()
+        scroll.add_widget(self._history_body)
+        content.add_widget(scroll)
+        self.add_widget(content)
+        self.refresh()
+
+    def refresh(self):
+        self._history_body.clear_widgets()
+        entries = self.app_ref.history.list_entries()
+        if not entries:
+            self._history_body.add_widget(self._label(
+                "No operations recorded yet.",
+                color=FG_MUTED, size=13, height=dp(38),
+            ))
+            return
+
+        for entry in entries:
+            succeeded = entry.get("status") == "success"
+            color = GREEN if succeeded else RED
+            card = self._card()
+            card.add_widget(self._label(
+                entry.get("title", "Operation"),
+                color=color, size=14, bold=True, height=dp(25),
+            ))
+            card.add_widget(self._label(
+                entry.get("timestamp", "").replace("T", " "),
+                color=FG_MUTED, size=10, height=dp(17),
+            ))
+            input_path = entry.get("input_path") or "Not recorded"
+            output_path = entry.get("output_path") or "Not recorded"
+            card.add_widget(self._label(
+                "INPUT  " + truncate_path(input_path, 96),
+                color=FG_DIM, size=10, height=dp(28),
+            ))
+            card.add_widget(self._label(
+                "OUTPUT " + truncate_path(output_path, 96),
+                color=FG_DIM, size=10, height=dp(28),
+            ))
+            detail = entry.get("detail", "")
+            if detail:
+                card.add_widget(self._label(
+                    truncate_path(detail, 120),
+                    color=FG_MUTED, size=10, height=dp(26),
+                ))
+            self._history_body.add_widget(card)
+
+
+# ============================================================================
 #  MERGE TAB
 # ============================================================================
 class MergeItem(BaseToolItem):
@@ -470,8 +542,10 @@ class MergeItem(BaseToolItem):
         settings.add_widget(flip_row)
         body.add_widget(settings)
 
-        body.add_widget(self._button("Merge Tiles", self._do_merge,
-                                     bg=GREEN, fg=BG_DEEP))
+        self.action_button = self._button(
+            "Merge Tiles", self._do_merge, bg=GREEN, fg=BG_DEEP
+        )
+        body.add_widget(self.action_button)
 
         self.progress = MDLinearProgressIndicator(size_hint_y=None, height=dp(4), value=0, type="determinate")
         body.add_widget(self.progress)
@@ -508,14 +582,26 @@ class MergeItem(BaseToolItem):
             th = int(self.tile_h.text)
             if tw <= 0 or th <= 0:
                 raise ValueError
-        except ValueError:
+            if tw * GRID_SIZE * th * GRID_SIZE > MAX_PROCESS_PIXELS:
+                raise ValueError("The merged map would exceed the safe 12-megapixel processing limit.")
+        except ValueError as exc:
             return self.app_ref.show_dialog(
-                "Error", "Tile size must be positive integers.")
+                "Error", str(exc) or "Tile size must be positive integers.")
+        if not self._begin_operation(
+            "Merged 144 radar tiles", self.input_folder, self.output_folder
+        ):
+            return
         self.app_ref.set_status("Merging tiles...", YELLOW)
         self.progress.value = 0
-        threading.Thread(target=self._worker,
-                         args=(self.input_folder, self.output_folder,
-                               tw, th, self.flip.active), daemon=True).start()
+        try:
+            threading.Thread(
+                target=self._worker,
+                args=(self.input_folder, self.output_folder,
+                      tw, th, self.flip.active),
+                daemon=True,
+            ).start()
+        except Exception as exc:
+            self._fail(str(exc))
 
     def _worker(self, in_dir, out_dir, tw, th, flip):
         try:
@@ -538,6 +624,8 @@ class MergeItem(BaseToolItem):
             for i in range(TOTAL_TILES):
                 p = os.path.join(in_dir, f"radar{i:02}.png")
                 with Image.open(p) as source:
+                    if source.width * source.height > MAX_PROCESS_PIXELS:
+                        raise ValueError(f"{os.path.basename(p)} exceeds the safe image size limit.")
                     img = source.convert("RGBA")
                 if img.size != (tw, th):
                     img = img.resize((tw, th), Image.LANCZOS)
@@ -546,7 +634,9 @@ class MergeItem(BaseToolItem):
                 found += 1
                 if i % 12 == 0:
                     self._update_progress(found / TOTAL_TILES)
-            canvas.save(os.path.join(out_dir, "map.png"))
+            _safe_save_image(canvas, os.path.join(out_dir, "map.png"))
+            if self.app_ref.storage is not None:
+                self.app_ref.storage.export_directory_if_needed(out_dir)
             self._done(found, tw, th)
         except Exception as e:
             self._fail(str(e))
@@ -557,18 +647,11 @@ class MergeItem(BaseToolItem):
 
     @mainthread
     def _done(self, found, tw, th):
-        try:
-            if self.app_ref.storage is not None:
-                self.app_ref.storage.export_directory_if_needed(self.output_folder)
-        except Exception as exc:
-            self.progress.value = 0
-            self.app_ref.set_status("Export failed", RED)
-            self.app_ref.show_dialog(
-                "Export failed",
-                f"map.png was generated in app storage, but could not be exported:\n{exc}")
-            return
         self.progress.value = 100
         self.app_ref.set_status(f"Merged {found} tiles -> map.png", GREEN)
+        self._finish_operation(
+            True, f"{found} tiles; output size {tw * GRID_SIZE}x{th * GRID_SIZE}"
+        )
         self.app_ref.show_dialog(
             "Done",
             f"map.png saved ({tw * GRID_SIZE}x{th * GRID_SIZE}) "
@@ -579,6 +662,7 @@ class MergeItem(BaseToolItem):
     def _fail(self, msg):
         self.progress.value = 0
         self.app_ref.set_status("Merge failed", RED)
+        self._finish_operation(False, msg)
         self.app_ref.show_dialog("Error", msg)
 
 
@@ -638,7 +722,8 @@ class SplitItem(BaseToolItem):
         settings.add_widget(flip_row)
         body.add_widget(settings)
 
-        body.add_widget(self._button("Split Map", self._do_split))
+        self.action_button = self._button("Split Map", self._do_split)
+        body.add_widget(self.action_button)
         self.progress = MDLinearProgressIndicator(size_hint_y=None, height=dp(4), value=0, type="determinate")
         body.add_widget(self.progress)
 
@@ -673,28 +758,51 @@ class SplitItem(BaseToolItem):
             th = int(self.tile_h.text)
             if tw <= 0 or th <= 0:
                 raise ValueError
-        except ValueError:
+            if tw * GRID_SIZE * th * GRID_SIZE > MAX_PROCESS_PIXELS:
+                raise ValueError("The split map would exceed the safe 12-megapixel processing limit.")
+        except ValueError as exc:
             return self.app_ref.show_dialog(
-                "Error", "Tile size must be positive integers.")
+                "Error", str(exc) or "Tile size must be positive integers.")
+        if not self._begin_operation(
+            "Split map into 144 tiles", self.image_path, self.output_folder
+        ):
+            return
         self.app_ref.set_status("Splitting map...", YELLOW)
         self.progress.value = 0
-        threading.Thread(target=self._worker,
-                         args=(self.image_path, self.output_folder,
-                               tw, th, self.flip.active), daemon=True).start()
+        try:
+            threading.Thread(
+                target=self._worker,
+                args=(self.image_path, self.output_folder,
+                      tw, th, self.flip.active),
+                daemon=True,
+            ).start()
+        except Exception as exc:
+            self._fail(str(exc))
 
     def _worker(self, img_path, out_dir, tw, th, flip):
         try:
             with Image.open(img_path) as source:
+                if source.width * source.height > MAX_PROCESS_PIXELS:
+                    raise ValueError("The selected map image exceeds the safe 12-megapixel processing limit.")
                 img = source.convert("RGBA")
             target = (tw * GRID_SIZE, th * GRID_SIZE)
             if img.size != target:
                 img = img.resize(target, Image.LANCZOS)
-            for i in range(TOTAL_TILES):
-                x, y = tile_position(i, tw, th, flip)
-                img.crop((x, y, x + tw, y + th)).save(
-                    os.path.join(out_dir, f"radar{i:02}.png"))
-                if i % 12 == 0:
-                    self._update_progress((i + 1) / TOTAL_TILES)
+            if not os.path.isdir(out_dir):
+                raise FileNotFoundError("The selected output folder is unavailable.")
+            filenames = [f"radar{i:02}.png" for i in range(TOTAL_TILES)]
+            with tempfile.TemporaryDirectory(
+                prefix=".radartool-split-", dir=out_dir
+            ) as staging_dir:
+                for i, filename in enumerate(filenames):
+                    x, y = tile_position(i, tw, th, flip)
+                    tile = img.crop((x, y, x + tw, y + th))
+                    tile.save(os.path.join(staging_dir, filename), format="PNG")
+                    if i % 12 == 0:
+                        self._update_progress((i + 1) / TOTAL_TILES)
+                commit_staged_files(staging_dir, out_dir, filenames)
+            if self.app_ref.storage is not None:
+                self.app_ref.storage.export_directory_if_needed(out_dir)
             self._done(tw, th)
         except Exception as e:
             self._fail(str(e))
@@ -705,18 +813,9 @@ class SplitItem(BaseToolItem):
 
     @mainthread
     def _done(self, tw, th):
-        try:
-            if self.app_ref.storage is not None:
-                self.app_ref.storage.export_directory_if_needed(self.output_folder)
-        except Exception as exc:
-            self.progress.value = 0
-            self.app_ref.set_status("Export failed", RED)
-            self.app_ref.show_dialog(
-                "Export failed",
-                f"Tiles were generated in app storage, but could not be exported:\n{exc}")
-            return
         self.progress.value = 100
         self.app_ref.set_status("Exported 144 tiles", GREEN)
+        self._finish_operation(True, f"144 output tiles at {tw}x{th}")
         self.app_ref.show_dialog(
             "Done",
             f"All {TOTAL_TILES} tiles exported at {tw}x{th}.")
@@ -725,6 +824,7 @@ class SplitItem(BaseToolItem):
     def _fail(self, msg):
         self.progress.value = 0
         self.app_ref.set_status("Split failed", RED)
+        self._finish_operation(False, msg)
         self.app_ref.show_dialog("Error", msg)
 
 
@@ -768,7 +868,8 @@ class TxDItem(BaseToolItem):
             color=FG_DIM, size=11, height=dp(56)))
         body.add_widget(info)
 
-        body.add_widget(self._button("Convert to TXD", self._do_convert))
+        self.action_button = self._button("Convert to TXD", self._do_convert)
+        body.add_widget(self.action_button)
         self.progress = MDLinearProgressIndicator(size_hint_y=None, height=dp(4), value=0, type="determinate")
         body.add_widget(self.progress)
 
@@ -797,33 +898,61 @@ class TxDItem(BaseToolItem):
             return self.app_ref.show_dialog("Error", "Select PNG folder.")
         if not self.output_folder:
             return self.app_ref.show_dialog("Error", "Select TXD folder.")
+        if not self._begin_operation(
+            "Converted PNG tiles to TXD", self.input_folder, self.output_folder
+        ):
+            return
         self.app_ref.set_status("Converting...", YELLOW)
         self.progress.value = 0
-        threading.Thread(target=self._worker, daemon=True).start()
-
-    def _worker(self):
         try:
+            threading.Thread(
+                target=self._worker,
+                args=(self.input_folder, self.output_folder),
+                daemon=True,
+            ).start()
+        except Exception as exc:
+            self._fail(str(exc))
+
+    def _worker(self, input_folder, output_folder):
+        try:
+            if not os.path.isdir(output_folder):
+                raise FileNotFoundError("The selected TXD output folder is unavailable.")
             files = sorted([
-                f for f in os.listdir(self.input_folder)
+                f for f in os.listdir(input_folder)
                 if f.lower().startswith("radar")
                 and f.lower().endswith(".png")
             ])
             if not files:
                 self._fail("No radar*.png files found in folder.")
                 return
-            ok, errors = 0, []
-            for idx, f in enumerate(files):
-                try:
-                    name = os.path.splitext(f)[0]
-                    with Image.open(os.path.join(self.input_folder, f)) as source:
-                        data = make_txd(name, source)
-                    with open(os.path.join(self.output_folder,
-                                           name + ".txd"), "wb") as fh:
-                        fh.write(data)
-                    ok += 1
-                except Exception as e:
-                    errors.append(f"{f}: {e}")
-                self._update_progress((idx + 1) / len(files))
+            ok, errors, generated = 0, [], []
+            with tempfile.TemporaryDirectory(
+                prefix=".radartool-txd-", dir=output_folder
+            ) as staging_dir:
+                for idx, filename in enumerate(files):
+                    try:
+                        name = os.path.splitext(filename)[0]
+                        with Image.open(os.path.join(input_folder, filename)) as source:
+                            if source.width * source.height > MAX_PROCESS_PIXELS:
+                                raise ValueError("Image exceeds the safe 12-megapixel processing limit.")
+                            data = make_txd(name, source)
+                        output_name = name + ".txd"
+                        if output_name in generated:
+                            raise ValueError(
+                                "Duplicate output name from multiple PNG files: "
+                                + output_name
+                            )
+                        with open(os.path.join(staging_dir, output_name), "wb") as target:
+                            target.write(data)
+                        generated.append(output_name)
+                        ok += 1
+                    except Exception as exc:
+                        errors.append(f"{filename}: {exc}")
+                    self._update_progress((idx + 1) / len(files))
+                if generated:
+                    commit_staged_files(staging_dir, output_folder, generated)
+            if self.app_ref.storage is not None and generated:
+                self.app_ref.storage.export_directory_if_needed(output_folder)
             self._done(ok, len(errors), errors)
         except Exception as e:
             self._fail(str(e))
@@ -834,16 +963,6 @@ class TxDItem(BaseToolItem):
 
     @mainthread
     def _done(self, ok, err_count, errors):
-        try:
-            if self.app_ref.storage is not None:
-                self.app_ref.storage.export_directory_if_needed(self.output_folder)
-        except Exception as exc:
-            self.progress.value = 0
-            self.app_ref.set_status("Export failed", RED)
-            self.app_ref.show_dialog(
-                "Export failed",
-                f"TXD files were generated in app storage, but could not be exported:\n{exc}")
-            return
         self.progress.value = 100
         if err_count:
             self.app_ref.set_status(
@@ -857,11 +976,16 @@ class TxDItem(BaseToolItem):
             self.app_ref.show_dialog(
                 "Done",
                 f"Successfully converted {ok} PNG file(s) to TXD!")
+        self._finish_operation(
+            err_count == 0,
+            f"{ok} converted; {err_count} failed. " + "; ".join(errors[:5]),
+        )
 
     @mainthread
     def _fail(self, msg):
         self.progress.value = 0
         self.app_ref.set_status("Convert failed", RED)
+        self._finish_operation(False, msg)
         self.app_ref.show_dialog("Error", msg)
 
 
@@ -879,6 +1003,7 @@ class ColorItem(BaseToolItem):
         self.replace_rgb = (255, 0, 0)
         self.tolerance = 40
         self._preview_event = None
+        self._image_load_token = 0
         self._build()
 
     def _build(self):
@@ -988,8 +1113,10 @@ class ColorItem(BaseToolItem):
         body.add_widget(tol_card)
 
         # --- save ---
-        body.add_widget(self._button("Save Result", self._save,
-                                     bg=GREEN, fg=BG_DEEP))
+        self.action_button = self._button(
+            "Save Result", self._save, bg=GREEN, fg=BG_DEEP
+        )
+        body.add_widget(self.action_button)
 
         scroll.add_widget(body)
         content.add_widget(scroll)
@@ -1001,26 +1128,51 @@ class ColorItem(BaseToolItem):
                   app_ref=self.app_ref)
 
     def _on_image(self, path):
+        self._image_load_token += 1
+        token = self._image_load_token
         self.app_ref.set_status("Loading image...", YELLOW)
         try:
-            self.image_path = path
-            self.pil_image = Image.open(path).convert("RGBA")
-            self._img_path_label.text = truncate_path(path)
-            self._img_path_label.text_color = hex_rgba(PRIMARY)
-
-            preview = self.pil_image.copy()
-            preview.thumbnail((400, 400), Image.LANCZOS)
-            self.preview_src = preview
-            self._orig_image.texture = pil_to_texture(preview)
-
-            # initial live preview with current settings
-            self._schedule_preview()
-            self.app_ref.set_status(
-                f"Loaded {os.path.basename(path)}", GREEN)
+            threading.Thread(
+                target=self._load_image_worker,
+                args=(path, token),
+                daemon=True,
+            ).start()
         except Exception as exc:
-            self.app_ref.set_status("Load failed", RED)
-            self.app_ref.show_dialog(
-                "Error", f"Could not open image:\n{exc}")
+            self._image_load_failed(token, exc)
+
+    def _load_image_worker(self, path, token):
+        try:
+            with Image.open(path) as source:
+                if source.width * source.height > MAX_PROCESS_PIXELS:
+                    raise ValueError("Image exceeds the safe 12-megapixel processing limit.")
+                loaded_image = source.convert("RGBA")
+            preview = loaded_image.copy()
+            preview.thumbnail((400, 400), Image.LANCZOS)
+            self._image_load_succeeded(path, token, loaded_image, preview)
+        except Exception as exc:
+            self._image_load_failed(token, exc)
+
+    @mainthread
+    def _image_load_succeeded(self, path, token, loaded_image, preview):
+        if token != self._image_load_token:
+            return
+        self.image_path = path
+        self.pil_image = loaded_image
+        self.preview_src = preview
+        self._img_path_label.text = truncate_path(path)
+        self._img_path_label.text_color = hex_rgba(PRIMARY)
+        self._orig_image.texture = pil_to_texture(preview)
+        self._schedule_preview()
+        self.app_ref.set_status(
+            f"Loaded {os.path.basename(path)}", GREEN)
+
+    @mainthread
+    def _image_load_failed(self, token, exc):
+        if token != self._image_load_token:
+            return
+        self.app_ref.set_status("Load failed", RED)
+        self.app_ref.show_dialog(
+            "Error", f"Could not open image:\n{exc}")
 
     def _tap_original(self, instance, touch):
         if self.preview_src is None:
@@ -1204,8 +1356,9 @@ class ColorItem(BaseToolItem):
             result = recolor_image(self.preview_src, self.target_rgb,
                                    self.replace_rgb, self.tolerance)
             self._live_image.texture = pil_to_texture(result)
-        except Exception:
-            pass
+        except Exception as exc:
+            self.app_ref.set_status("Preview update failed", RED)
+            # Preview errors are visible but do not interrupt the editor.
 
     # -- save ----------------------------------------------------------
     def _save(self):
@@ -1216,44 +1369,58 @@ class ColorItem(BaseToolItem):
         def on_pick(output_path):
             if not output_path:
                 return
+            if not self._begin_operation(
+                "Recolored and saved image", self.image_path, output_path
+            ):
+                return
+            # Keep a reference to the immutable source image instead of making
+            # a second full-size copy on the UI thread.
+            image_snapshot = self.pil_image
+            target_snapshot = tuple(self.target_rgb)
+            replace_snapshot = tuple(self.replace_rgb)
+            tolerance_snapshot = int(self.tolerance)
             self.app_ref.set_status("Applying color replacement...", YELLOW)
-            threading.Thread(target=self._save_worker,
-                             args=(output_path,), daemon=True).start()
+            try:
+                threading.Thread(
+                    target=self._save_worker,
+                    args=(output_path, image_snapshot, target_snapshot,
+                          replace_snapshot, tolerance_snapshot),
+                    daemon=True,
+                ).start()
+            except Exception as exc:
+                self._save_fail(str(exc))
 
         pick_save_file(on_pick, app_ref=self.app_ref,
                        default_name="recolored.png")
 
-    def _save_worker(self, out_path):
+    def _save_worker(self, out_path, image, target_rgb, replace_rgb, tolerance):
         try:
             if not out_path.lower().endswith(".png"):
                 out_path += ".png"
-            result = recolor_image(self.pil_image, self.target_rgb,
-                                   self.replace_rgb, self.tolerance)
-            result.save(out_path)
-            self._save_done(out_path)
+            result = recolor_image(image, target_rgb, replace_rgb, tolerance)
+            _safe_save_image(result, out_path)
+            filename = os.path.basename(out_path)
+            output_description = out_path
+            if self.app_ref.storage is not None:
+                output_description = self.app_ref.storage.describe_path(out_path)
+                filename = self.app_ref.storage.export_file_if_needed(out_path)
+            self._save_done(filename, output_description)
         except Exception as exc:
             self._save_fail(str(exc))
 
     @mainthread
-    def _save_done(self, path):
-        try:
-            filename = os.path.basename(path)
-            if self.app_ref.storage is not None:
-                filename = self.app_ref.storage.export_file_if_needed(path)
-        except Exception as exc:
-            self.app_ref.set_status("Export failed", RED)
-            self.app_ref.show_dialog(
-                "Export failed",
-                f"The image was created in app storage, but export failed:\n{exc}")
-            return
-
+    def _save_done(self, filename, output_description):
+        if self._history_context is not None:
+            self._history_context["output_path"] = output_description
         self.app_ref.set_status(f"Saved -> {filename}", GREEN)
+        self._finish_operation(True, f"Saved file: {filename}")
         self.app_ref.show_dialog(
             "Done", f"Color replaced and saved!\n{filename}")
 
     @mainthread
     def _save_fail(self, msg):
         self.app_ref.set_status("Save failed", RED)
+        self._finish_operation(False, msg)
         self.app_ref.show_dialog("Error", msg)
 
 
@@ -1269,6 +1436,9 @@ class RadarApp(MDApp):
 
         self.storage = None
         self._storage_init_error = None
+        self.history = OperationHistory(
+            os.path.join(self.user_data_dir, "operation_history.json")
+        )
         if ANDROID:
             try:
                 self.storage = AndroidStorage(self)
@@ -1283,9 +1453,13 @@ class RadarApp(MDApp):
         self.split_tab = SplitItem(self)
         self.txd_tab = TxDItem(self)
         self.color_tab = ColorItem(self)
+        self.history_tab = HistoryItem(self)
 
         screen_manager = ScreenManager()
-        for screen in (self.merge_tab, self.split_tab, self.txd_tab, self.color_tab):
+        for screen in (
+            self.merge_tab, self.split_tab, self.txd_tab,
+            self.color_tab, self.history_tab,
+        ):
             screen_manager.add_widget(screen)
         screen_manager.current = self.merge_tab.name
         root.add_widget(screen_manager)
@@ -1298,7 +1472,10 @@ class RadarApp(MDApp):
             padding=(dp(4), 0, dp(4), 0),
             md_bg_color=hex_rgba(BG_SIDEBAR),
         )
-        for screen in (self.merge_tab, self.split_tab, self.txd_tab, self.color_tab):
+        for screen in (
+            self.merge_tab, self.split_tab, self.txd_tab,
+            self.color_tab, self.history_tab,
+        ):
             button = MDButton(
                 MDButtonText(text=screen.tab_text),
                 style="text",
