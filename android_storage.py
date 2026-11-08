@@ -4,9 +4,15 @@ Selected Android documents/directories are copied into app-private staging
 folders so image algorithms can keep using normal filesystem paths. Results
 are then exported to the user-selected SAF destination.
 """
+import io
 import mimetypes
 import os
 import tempfile
+
+
+def _to_java_byte_values(data):
+    """Return PyJNIus-compatible byte values in the unsigned 0..255 range."""
+    return list(bytes(data))
 
 
 class AndroidStorage:
@@ -218,19 +224,31 @@ class AndroidStorage:
         finally:
             stream.close()
 
-    def _write_bytes_to_uri(self, uri, data):
+    def _write_stream_to_uri(self, uri, source):
+        """Copy a binary stream to SAF without loading the whole file in RAM.
+
+        PyJNIus converts Python integer lists to Java primitive arrays. Keep
+        each value in the documented byte-value range (0..255); converting
+        values >= 128 to negative Python integers can fail during JNI array
+        conversion with "can't convert negative value to unsigned char".
+        """
         stream = self.resolver.openOutputStream(uri)
         if stream is None:
             raise RuntimeError("Android could not open the destination for writing.")
         try:
-            chunk_size = 32768
-            for offset in range(0, len(data), chunk_size):
-                chunk = data[offset:offset + chunk_size]
-                signed = [byte if byte < 128 else byte - 256 for byte in chunk]
-                stream.write(signed)
+            while True:
+                chunk = source.read(32768)
+                if not chunk:
+                    break
+                stream.write(_to_java_byte_values(chunk))
             stream.flush()
         finally:
             stream.close()
+
+    def _write_bytes_to_uri(self, uri, data):
+        """Compatibility wrapper for callers that already have bytes."""
+        with io.BytesIO(data) as source:
+            self._write_stream_to_uri(uri, source)
 
     def _delete_existing_child(self, tree_uri, name):
         for doc_id, existing_name, _mime_type in self._list_children(tree_uri):
@@ -256,7 +274,7 @@ class AndroidStorage:
         if target_uri is None:
             raise RuntimeError(f"Android could not create {filename!r} in the selected folder.")
         with open(local_path, "rb") as source:
-            self._write_bytes_to_uri(target_uri, source.read())
+            self._write_stream_to_uri(target_uri, source)
 
     def export_directory_if_needed(self, local_directory):
         tree_uri = self._output_dirs.get(os.path.realpath(local_directory))
@@ -285,6 +303,6 @@ class AndroidStorage:
             return os.path.basename(local_path)
         display_name = self._display_name(uri) or os.path.basename(local_path)
         with open(local_path, "rb") as source:
-            self._write_bytes_to_uri(uri, source.read())
+            self._write_stream_to_uri(uri, source)
         self._output_files.pop(key, None)
         return display_name
