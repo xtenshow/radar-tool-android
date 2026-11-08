@@ -67,8 +67,11 @@ jobs:
           pip install --upgrade pip==24.3.1
           pip install buildozer==1.5.0 Cython==0.29.36
 
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
       - name: Validate Python syntax
-        run: python -m compileall -q main.py android_storage.py
+        run: python -m compileall -q main.py android_storage.py tests
 
       - name: Package source archive
         run: |
