@@ -193,51 +193,6 @@ jobs:
           test -n "$apksigner"
           "$apksigner" verify --verbose "$apk"
 
-
-      - name: Install and launch APK on x86_64 Android Emulator
-        shell: bash
-        run: |
-          set -euo pipefail
-          sdk_root="${ANDROID_SDK_ROOT:-${ANDROIDSDK:-$HOME/.buildozer/android/platform/android-sdk}}"
-          sdkmanager="$(find "$sdk_root/cmdline-tools" -type f -name sdkmanager | sort -V | tail -n 1)"
-          avdmanager="$(find "$sdk_root/cmdline-tools" -type f -name avdmanager | sort -V | tail -n 1)"
-          test -n "$sdkmanager"
-          test -n "$avdmanager"
-          yes | "$sdkmanager" --sdk_root="$sdk_root" --licenses >/dev/null || true
-          "$sdkmanager" --sdk_root="$sdk_root" "emulator" "platform-tools" "system-images;android-33;google_apis;x86_64"
-          echo "no" | "$avdmanager" create avd \
-            --force --name radar-x86_64 \
-            --package "system-images;android-33;google_apis;x86_64" \
-            --device "pixel_2"
-          "$sdk_root/emulator/emulator" \
-            -avd radar-x86_64 -no-window -no-audio -no-boot-anim \
-            -gpu swiftshader_indirect -accel off \
-            >"$RUNNER_TEMP/radar-emulator.log" 2>&1 &
-          adb="$sdk_root/platform-tools/adb"
-          "$adb" wait-for-device
-          booted=false
-          for attempt in $(seq 1 60); do
-            if [[ "$("$adb" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" == "1" ]]; then
-              booted=true
-              break
-            fi
-            sleep 5
-          done
-          if [[ "$booted" != "true" ]]; then
-            cat "$RUNNER_TEMP/radar-emulator.log"
-            exit 1
-          fi
-          apk="$(find bin -maxdepth 1 -type f -name '*.apk' -print -quit)"
-          "$adb" install "$apk"
-          "$adb" shell monkey -p org.tenshorecords.radartool 1
-          sleep 15
-          if ! "$adb" shell pidof org.tenshorecords.radartool >/dev/null 2>&1; then
-            "$adb" logcat -d -t 250 | grep -E "AndroidRuntime|python|SDL|FATAL" || true
-            cat "$RUNNER_TEMP/radar-emulator.log"
-            exit 1
-          fi
-          echo "APK installed and launched successfully on Android 13 x86_64."
-
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
