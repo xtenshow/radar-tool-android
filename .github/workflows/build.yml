@@ -71,7 +71,7 @@ jobs:
         run: python -m unittest discover -s tests -v
 
       - name: Validate Python syntax
-        run: python -m compileall -q main.py android_storage.py tests
+        run: python -m compileall -q main.py android_storage.py file_browser.py tests
 
       - name: Package source archive
         run: |
