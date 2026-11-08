@@ -5,6 +5,7 @@ folders so image algorithms can keep using normal filesystem paths. Results
 are then exported to the user-selected SAF destination.
 """
 import io
+import json
 import mimetypes
 import os
 import tempfile
@@ -38,6 +39,10 @@ class AndroidStorage:
         self._next_request_code = self.REQUEST_CODE_BASE
         self.cache_root = os.path.join(app_ref.user_data_dir, "radar_saf_cache")
         os.makedirs(self.cache_root, exist_ok=True)
+        self._browser_root_file = os.path.join(
+            app_ref.user_data_dir, "browser_storage.json")
+        self._browser_root_uri = None
+        self._load_browser_root()
         self._android_activity_module = android_activity
         android_activity.bind(on_activity_result=self._on_activity_result)
 
@@ -45,6 +50,104 @@ class AndroidStorage:
         message = str(exc).strip() or "Android storage operation failed."
         self.app_ref.set_status("File access failed", "#ef4444")
         self.app_ref.show_dialog(title, message[:1200])
+
+    def _load_browser_root(self):
+        """Restore the user's persisted SAF tree grant, if one exists."""
+        try:
+            from jnius import autoclass
+            with open(self._browser_root_file, "r", encoding="utf-8") as source:
+                saved = json.load(source)
+            uri_text = saved.get("tree_uri")
+            if uri_text:
+                self._browser_root_uri = autoclass(
+                    "android.net.Uri").parse(uri_text)
+        except FileNotFoundError:
+            return
+        except Exception as exc:
+            self._browser_root_uri = None
+            print("Could not restore SAF browser root:", exc)
+
+    def browser_root_available(self):
+        return self._browser_root_uri is not None
+
+    def get_root_document_id(self):
+        if self._browser_root_uri is None:
+            raise RuntimeError("Choose a shared folder to grant access first.")
+        return str(self.DocumentsContract.getTreeDocumentId(
+            self._browser_root_uri))
+
+    def request_root_access(self, callback):
+        """Request one persistent root grant; all later browsing is in-app."""
+        intent = self.Intent(self.Intent.ACTION_OPEN_DOCUMENT_TREE)
+        intent.addFlags(
+            self.Intent.FLAG_GRANT_READ_URI_PERMISSION
+            | self.Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            | self.Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+        )
+        self._launch(intent, {"kind": "browser_root", "callback": callback})
+
+    def list_browser_directory(self, parent_document_id):
+        if self._browser_root_uri is None:
+            raise RuntimeError("Storage access has not been granted.")
+        items = []
+        for document_id, name, mime_type in self._list_children(
+                self._browser_root_uri, parent_document_id):
+            items.append({
+                "document_id": document_id,
+                "name": name,
+                "is_dir": mime_type == self.Document.MIME_TYPE_DIR,
+            })
+        return items
+
+    def stage_browser_file(self, document_id, callback):
+        uri = self.DocumentsContract.buildDocumentUriUsingTree(
+            self._browser_root_uri, document_id)
+        name = self._safe_name(self._display_name(uri) or "selected_image")
+        local_dir = self._new_staging_dir("input_file_")
+        local_path = os.path.join(local_dir, name)
+        self._copy_uri_to_path(uri, local_path)
+        callback(local_path)
+
+    def stage_browser_directory(self, document_id, output, callback):
+        local_dir = self._new_staging_dir("output_" if output else "input_")
+        if output:
+            self._output_dirs[os.path.realpath(local_dir)] = (
+                self._browser_root_uri, document_id)
+        else:
+            self._copy_tree_files_to_directory(
+                self._browser_root_uri, local_dir,
+                parent_document_id=document_id)
+        callback(local_dir)
+
+    def create_browser_save_target(self, parent_document_id, filename, callback):
+        filename = self._safe_name(filename)
+        for _doc_id, existing_name, _mime in self._list_children(
+                self._browser_root_uri, parent_document_id):
+            if existing_name.casefold() == filename.casefold():
+                raise FileExistsError(
+                    f"{filename!r} already exists. Choose a different name.")
+        parent_uri = self.DocumentsContract.buildDocumentUriUsingTree(
+            self._browser_root_uri, parent_document_id)
+        target_uri = self.DocumentsContract.createDocument(
+            self.resolver, parent_uri, "image/png", filename)
+        if target_uri is None:
+            raise RuntimeError(f"Android could not create {filename!r}.")
+        local_dir = self._new_staging_dir("save_")
+        local_path = os.path.join(local_dir, filename)
+        self._output_files[os.path.realpath(local_path)] = target_uri
+        callback(local_path)
+
+    def _finish_browser_root_pick(self, uri, intent, callback):
+        read_flag = int(self.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        write_flag = int(self.Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+        granted = int(intent.getFlags()) & (read_flag | write_flag)
+        if granted == 0:
+            granted = read_flag | write_flag
+        self.resolver.takePersistableUriPermission(uri, granted)
+        self._browser_root_uri = uri
+        with open(self._browser_root_file, "w", encoding="utf-8") as target:
+            json.dump({"tree_uri": str(uri.toString())}, target)
+        callback(True)
 
     def _launch(self, intent, request):
         code = self._next_request_code
@@ -111,7 +214,10 @@ class AndroidStorage:
             if uri is None:
                 raise RuntimeError("Android returned no document URI.")
             kind = request["kind"]
-            if kind == "file":
+            if kind == "browser_root":
+                self._finish_browser_root_pick(
+                    uri, intent, request["callback"])
+            elif kind == "file":
                 self._finish_file_pick(uri, request["callback"])
             elif kind == "directory":
                 self._finish_directory_pick(
@@ -133,7 +239,8 @@ class AndroidStorage:
     def _finish_directory_pick(self, tree_uri, output, callback):
         local_dir = self._new_staging_dir("output_" if output else "input_")
         if output:
-            self._output_dirs[os.path.realpath(local_dir)] = tree_uri
+            self._output_dirs[os.path.realpath(local_dir)] = (
+                tree_uri, self.DocumentsContract.getTreeDocumentId(tree_uri))
         else:
             self._copy_tree_files_to_directory(tree_uri, local_dir)
         callback(local_dir)
@@ -164,10 +271,11 @@ class AndroidStorage:
                 cursor.close()
         return None
 
-    def _list_children(self, tree_uri):
-        tree_id = self.DocumentsContract.getTreeDocumentId(tree_uri)
+    def _list_children(self, tree_uri, parent_document_id=None):
+        if parent_document_id is None:
+            parent_document_id = self.DocumentsContract.getTreeDocumentId(tree_uri)
         children_uri = self.DocumentsContract.buildChildDocumentsUriUsingTree(
-            tree_uri, tree_id)
+            tree_uri, parent_document_id)
         columns = [
             self.Document.COLUMN_DOCUMENT_ID,
             self.Document.COLUMN_DISPLAY_NAME,
@@ -194,9 +302,11 @@ class AndroidStorage:
             cursor.close()
         return items
 
-    def _copy_tree_files_to_directory(self, tree_uri, local_dir):
+    def _copy_tree_files_to_directory(
+            self, tree_uri, local_dir, parent_document_id=None):
         copied = 0
-        for doc_id, name, mime_type in self._list_children(tree_uri):
+        for doc_id, name, mime_type in self._list_children(
+                tree_uri, parent_document_id):
             if mime_type == self.Document.MIME_TYPE_DIR:
                 continue
             document_uri = self.DocumentsContract.buildDocumentUriUsingTree(
@@ -250,8 +360,9 @@ class AndroidStorage:
         with io.BytesIO(data) as source:
             self._write_stream_to_uri(uri, source)
 
-    def _delete_existing_child(self, tree_uri, name):
-        for doc_id, existing_name, _mime_type in self._list_children(tree_uri):
+    def _delete_existing_child(self, tree_uri, name, parent_document_id=None):
+        for doc_id, existing_name, _mime_type in self._list_children(
+                tree_uri, parent_document_id):
             if existing_name == name:
                 existing_uri = self.DocumentsContract.buildDocumentUriUsingTree(
                     tree_uri, doc_id)
@@ -262,13 +373,15 @@ class AndroidStorage:
                         f"Cannot replace existing file {name!r} in the selected folder.")
                 return
 
-    def _write_file_to_tree(self, tree_uri, local_path):
+    def _write_file_to_tree(
+            self, tree_uri, local_path, parent_document_id=None):
         filename = self._safe_name(os.path.basename(local_path))
         mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-        self._delete_existing_child(tree_uri, filename)
-        tree_id = self.DocumentsContract.getTreeDocumentId(tree_uri)
+        if parent_document_id is None:
+            parent_document_id = self.DocumentsContract.getTreeDocumentId(tree_uri)
+        self._delete_existing_child(tree_uri, filename, parent_document_id)
         parent_uri = self.DocumentsContract.buildDocumentUriUsingTree(
-            tree_uri, tree_id)
+            tree_uri, parent_document_id)
         target_uri = self.DocumentsContract.createDocument(
             self.resolver, parent_uri, mime_type, filename)
         if target_uri is None:
@@ -277,9 +390,10 @@ class AndroidStorage:
             self._write_stream_to_uri(target_uri, source)
 
     def export_directory_if_needed(self, local_directory):
-        tree_uri = self._output_dirs.get(os.path.realpath(local_directory))
-        if tree_uri is None:
+        destination = self._output_dirs.get(os.path.realpath(local_directory))
+        if destination is None:
             return 0
+        tree_uri, parent_document_id = destination
         if not os.path.isdir(local_directory):
             raise RuntimeError("The app's staging output folder no longer exists.")
         files = sorted(
@@ -293,7 +407,7 @@ class AndroidStorage:
         if not files:
             return 0
         for path in files:
-            self._write_file_to_tree(tree_uri, path)
+            self._write_file_to_tree(tree_uri, path, parent_document_id)
         return len(files)
 
     def export_file_if_needed(self, local_path):
