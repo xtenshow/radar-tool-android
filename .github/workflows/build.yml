@@ -104,6 +104,45 @@ jobs:
           test "$(cat "$PIP_CONSTRAINT")" = "pip==25.3"
           echo "Constraint ready: $(cat "$PIP_CONSTRAINT")"
 
+      - name: Cache pycairo source from PyPI
+        shell: bash
+        timeout-minutes: 8
+        run: |
+          set -euo pipefail
+          # Initialise the pinned python-for-android checkout and its build paths.
+          buildozer android p4a -- --help >/dev/null 2>&1
+          CACHE_DIR=".buildozer/android/platform/build-arm64-v8a_armeabi-v7a_x86_64/packages/pycairo"
+          mkdir -p "$CACHE_DIR"
+          PYCAIRO_URL="$(python - <<'PY'
+          import json
+          import urllib.request
+
+          request = urllib.request.Request(
+              "https://pypi.org/pypi/pycairo/1.28.0/json",
+              headers={"User-Agent": "RadarTool-Android-Build/1.0"},
+          )
+          with urllib.request.urlopen(request, timeout=30) as response:
+              metadata = json.load(response)
+          sdists = [
+              item["url"] for item in metadata["urls"]
+              if item["packagetype"] == "sdist"
+              and item["filename"] == "pycairo-1.28.0.tar.gz"
+          ]
+          if len(sdists) != 1:
+              raise SystemExit(
+                  f"Expected one pycairo 1.28.0 sdist, found {len(sdists)}")
+          print(sdists[0])
+          PY
+          )"
+          ARCHIVE="$CACHE_DIR/pycairo-1.28.0.tar.gz"
+          curl --fail --location --retry 10 --retry-all-errors \
+            --retry-delay 3 --retry-max-time 300 \
+            "$PYCAIRO_URL" --output "$ARCHIVE"
+          tar -tzf "$ARCHIVE" >/dev/null
+          touch "$CACHE_DIR/.mark-pycairo-1.28.0.tar.gz"
+          test -s "$ARCHIVE"
+          echo "Cached verified pycairo source archive: $(du -h "$ARCHIVE" | cut -f1)"
+
       - name: Build APK with Buildozer
         run: |
           buildozer android debug
