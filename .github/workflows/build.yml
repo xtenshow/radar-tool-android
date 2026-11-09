@@ -98,9 +98,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          printf 'pip==25.3\\n' > "$RUNNER_TEMP/pip-constraints.txt"
+          printf '%s\\n' 'pip==25.3' > "$RUNNER_TEMP/pip-constraints.txt"
           echo "PIP_CONSTRAINT=$RUNNER_TEMP/pip-constraints.txt" >> "$GITHUB_ENV"
-          cat "$RUNNER_TEMP/pip-constraints.txt"
+          test "$(cat "$RUNNER_TEMP/pip-constraints.txt")" = "pip==25.3"
+          python -m pip install --dry-run --upgrade pip
 
       - name: Build APK with Buildozer
         run: |
