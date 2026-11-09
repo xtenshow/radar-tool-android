@@ -25,6 +25,18 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Verify Java toolchain
+        run: |
+          java -version
+          echo "JAVA_HOME=$JAVA_HOME"
+          test "$(java -version 2>&1 | head -n 1 | grep -oE '[0-9]+' | head -n 1)" = "17"
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
