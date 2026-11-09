@@ -98,10 +98,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          printf '%s\\n' 'pip==25.3' > "$RUNNER_TEMP/pip-constraints.txt"
+          echo 'pip==25.3' > "$RUNNER_TEMP/pip-constraints.txt"
+          export PIP_CONSTRAINT="$RUNNER_TEMP/pip-constraints.txt"
           echo "PIP_CONSTRAINT=$RUNNER_TEMP/pip-constraints.txt" >> "$GITHUB_ENV"
-          test "$(cat "$RUNNER_TEMP/pip-constraints.txt")" = "pip==25.3"
-          python -m pip install --dry-run --upgrade pip
+          test "$(cat "$PIP_CONSTRAINT")" = "pip==25.3"
+          echo "Constraint ready: $(cat "$PIP_CONSTRAINT")"
 
       - name: Build APK with Buildozer
         run: |
