@@ -395,7 +395,10 @@ class BaseToolItem(Screen):
         card = self._card()
         card.add_widget(self._label(title, color=FG, size=14,
                                     bold=True, height=dp(24)))
-        path_lbl = self._label(hint, color=FG_MUTED, size=11, height=dp(20))
+        path_lbl = self._label(hint, color=FG_MUTED, size=11, height=dp(34))
+        path_lbl.halign = "left"
+        path_lbl.valign = "middle"
+        path_lbl.bind(size=lambda w, *_: setattr(w, "text_size", (w.width, None)))
         card.add_widget(path_lbl)
         btn = MDButton(MDButtonText(text="Browse"), style="tonal",
                        size_hint_y=None, height=dp(42))
@@ -500,12 +503,12 @@ class MergeItem(BaseToolItem):
 
     def _on_input(self, path):
         self.input_folder = path
-        self.input_label.text = truncate_path(path)
+        self.input_label.text = self.app_ref.display_path(path)
         self.input_label.text_color = hex_rgba(PRIMARY)
 
     def _on_output(self, path):
         self.output_folder = path
-        self.output_label.text = truncate_path(path)
+        self.output_label.text = self.app_ref.display_path(path)
         self.output_label.text_color = hex_rgba(PRIMARY)
 
     def _do_merge(self):
@@ -572,6 +575,9 @@ class MergeItem(BaseToolItem):
     @mainthread
     def _done(self, found, tw, th):
         self.progress.value = 100
+        self.app_ref.record_operation(
+            "Merge", self.input_folder, self.output_folder,
+            f"{found} tiles -> map.png ({tw * GRID_SIZE}x{th * GRID_SIZE})")
         self.app_ref.set_status(f"Merged {found} tiles -> map.png", GREEN)
         self.app_ref.show_dialog(
             "Done",
@@ -659,12 +665,12 @@ class SplitItem(BaseToolItem):
 
     def _on_image(self, path):
         self.image_path = path
-        self.image_label.text = truncate_path(path)
+        self.image_label.text = self.app_ref.display_path(path)
         self.image_label.text_color = hex_rgba(PRIMARY)
 
     def _on_output(self, path):
         self.output_folder = path
-        self.output_label.text = truncate_path(path)
+        self.output_label.text = self.app_ref.display_path(path)
         self.output_label.text_color = hex_rgba(PRIMARY)
 
     def _do_split(self):
@@ -712,6 +718,9 @@ class SplitItem(BaseToolItem):
     @mainthread
     def _done(self, tw, th):
         self.progress.value = 100
+        self.app_ref.record_operation(
+            "Split", self.image_path, self.output_folder,
+            f"144 tiles at {tw}x{th}")
         self.app_ref.set_status("Exported 144 tiles", GREEN)
         self.app_ref.show_dialog(
             "Done",
@@ -780,12 +789,12 @@ class TxDItem(BaseToolItem):
 
     def _on_input(self, path):
         self.input_folder = path
-        self.input_label.text = truncate_path(path)
+        self.input_label.text = self.app_ref.display_path(path)
         self.input_label.text_color = hex_rgba(PRIMARY)
 
     def _on_output(self, path):
         self.output_folder = path
-        self.output_label.text = truncate_path(path)
+        self.output_label.text = self.app_ref.display_path(path)
         self.output_label.text_color = hex_rgba(PRIMARY)
 
     def _do_convert(self):
@@ -833,6 +842,9 @@ class TxDItem(BaseToolItem):
     @mainthread
     def _done(self, ok, err_count, errors):
         self.progress.value = 100
+        self.app_ref.record_operation(
+            "TXD", self.input_folder, self.output_folder,
+            f"{ok} converted, {err_count} failed")
         if err_count:
             self.app_ref.set_status(
                 f"{ok} converted, {err_count} failed", RED)
@@ -887,7 +899,11 @@ class ColorItem(BaseToolItem):
                                         bold=True, height=dp(24)))
         self._img_path_label = self._label("No image loaded",
                                            color=FG_MUTED, size=11,
-                                           height=dp(20))
+                                           height=dp(34))
+        self._img_path_label.halign = "left"
+        self._img_path_label.valign = "middle"
+        self._img_path_label.bind(
+            size=lambda w, *_: setattr(w, "text_size", (w.width, None)))
         img_card.add_widget(self._img_path_label)
         b = MDButton(MDButtonText(text="Browse Image"), style="tonal",
                      size_hint_y=None, height=dp(42))
@@ -1028,7 +1044,7 @@ class ColorItem(BaseToolItem):
         self.image_path = path
         self.pil_image = full_image
         self.preview_src = preview
-        self._img_path_label.text = truncate_path(path)
+        self._img_path_label.text = self.app_ref.display_path(path)
         self._img_path_label.text_color = hex_rgba(PRIMARY)
         self._orig_image.texture = pil_to_texture(preview)
         self._schedule_preview()
@@ -1275,7 +1291,10 @@ class ColorItem(BaseToolItem):
             self._save_fail(str(exc))
 
     @mainthread
-    def _save_done(self, filename):
+    def _save_done(self, filename, output_path):
+        self.app_ref.record_operation(
+            "Color", self.image_path, output_path,
+            f"Saved {filename}; target={self.target_rgb}; replacement={self.replace_rgb}; tolerance={self.tolerance}")
         self.app_ref.set_status(f"Saved -> {filename}", GREEN)
         self.app_ref.show_dialog(
             "Done", f"Color replaced and saved!\n{filename}")
@@ -1284,6 +1303,85 @@ class ColorItem(BaseToolItem):
     def _save_fail(self, msg):
         self.app_ref.set_status("Save failed", RED)
         self.app_ref.show_dialog("Error", msg)
+
+
+
+# ============================================================================
+#  OPERATION HISTORY
+# ============================================================================
+class HistoryItem(BaseToolItem):
+    def __init__(self, app_ref, **kw):
+        super().__init__(app_ref, name="history", text="History",
+                         icon="history", **kw)
+        self._build()
+
+    def _build(self):
+        content = self._make_content_root()
+        content.add_widget(self._header(
+            "Operation History",
+            "Recent successful Split, Merge, TXD and Color jobs"))
+
+        toolbar = MDBoxLayout(
+            orientation="horizontal", size_hint_y=None, height=dp(42),
+            padding=(dp(16), 0, dp(16), 0))
+        toolbar.add_widget(Widget())
+        refresh = MDButton(
+            MDButtonText(text="Refresh"),
+            style="tonal",
+            size_hint_x=None, width=dp(104),
+            size_hint_y=None, height=dp(38))
+        refresh.bind(on_release=lambda *_: self.refresh())
+        toolbar.add_widget(refresh)
+        content.add_widget(toolbar)
+
+        self.scroll = ScrollView()
+        self.records_box = MDBoxLayout(
+            orientation="vertical", size_hint_y=None,
+            spacing=dp(10), padding=(dp(16), dp(8), dp(16), dp(16)))
+        self.records_box.bind(minimum_height=self.records_box.setter("height"))
+        self.scroll.add_widget(self.records_box)
+        content.add_widget(self.scroll)
+        self.add_widget(content)
+        self.bind(on_pre_enter=lambda *_: self.refresh())
+
+    def refresh(self):
+        self.records_box.clear_widgets()
+        records = self.app_ref.history.list_records()
+        if not records:
+            empty = self._card()
+            empty.add_widget(self._label(
+                "No operations yet", color=FG, size=15, bold=True,
+                height=dp(28)))
+            empty.add_widget(self._label(
+                "Completed operations will appear here and remain after you close the app.",
+                color=FG_DIM, size=12, height=dp(42)))
+            self.records_box.add_widget(empty)
+            return
+
+        for record in records:
+            card = self._card()
+            timestamp = record.get("timestamp", "")
+            try:
+                from datetime import datetime
+                parsed = datetime.fromisoformat(timestamp)
+                date_text = parsed.astimezone().strftime("%Y-%m-%d  %H:%M")
+            except Exception:
+                date_text = timestamp
+            title = f'{record.get("operation", "Operation")}  •  {date_text}'
+            card.add_widget(self._label(
+                title, color=PRIMARY_HOVER, size=13, bold=True,
+                height=dp(26)))
+            card.add_widget(self._label(
+                "Input: " + (record.get("input") or "—"),
+                color=FG_DIM, size=11, height=dp(34)))
+            card.add_widget(self._label(
+                "Output: " + (record.get("output") or "—"),
+                color=FG_DIM, size=11, height=dp(34)))
+            details = record.get("details", "")
+            if details:
+                card.add_widget(self._label(
+                    details, color=FG, size=12, height=dp(28)))
+            self.records_box.add_widget(card)
 
 
 # ============================================================================
@@ -1298,6 +1396,7 @@ class RadarApp(MDApp):
 
         self.storage = None
         self._storage_init_error = None
+        self.history = OperationHistory(self.user_data_dir)
         if ANDROID:
             try:
                 self.storage = AndroidStorage(self)
@@ -1312,9 +1411,11 @@ class RadarApp(MDApp):
         self.split_tab = SplitItem(self)
         self.txd_tab = TxDItem(self)
         self.color_tab = ColorItem(self)
+        self.history_tab = HistoryItem(self)
 
         screen_manager = ScreenManager()
-        for screen in (self.merge_tab, self.split_tab, self.txd_tab, self.color_tab):
+        for screen in (self.merge_tab, self.split_tab, self.txd_tab,
+                       self.color_tab, self.history_tab):
             screen_manager.add_widget(screen)
         screen_manager.current = self.merge_tab.name
         root.add_widget(screen_manager)
@@ -1327,7 +1428,8 @@ class RadarApp(MDApp):
             padding=(dp(4), 0, dp(4), 0),
             md_bg_color=hex_rgba(BG_SIDEBAR),
         )
-        for screen in (self.merge_tab, self.split_tab, self.txd_tab, self.color_tab):
+        for screen in (self.merge_tab, self.split_tab, self.txd_tab,
+                       self.color_tab, self.history_tab):
             button = MDButton(
                 MDButtonText(text=screen.tab_text),
                 style="text",
@@ -1407,6 +1509,21 @@ class RadarApp(MDApp):
             # Do not crash startup if a vendor ROM does not accept the flags.
             self.set_status("System navigation could not be hidden", YELLOW)
             print("Immersive navigation setup failed:", exc)
+
+    def display_path(self, path):
+        if self.storage is not None:
+            return self.storage.get_display_path(path)
+        return str(path or "").replace(os.sep, "/")
+
+    def record_operation(self, operation, input_path, output_path, details=""):
+        try:
+            source = self.display_path(input_path) if input_path else ""
+            destination = self.display_path(output_path) if output_path else ""
+            self.history.record(operation, source, destination, details)
+            if hasattr(self, "history_tab"):
+                Clock.schedule_once(lambda _dt: self.history_tab.refresh(), 0)
+        except Exception as exc:
+            print("Could not save operation history:", exc)
 
     def set_status(self, text, color=GREEN):
         self._status_label.text = text

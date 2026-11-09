@@ -41,6 +41,12 @@ class InternalFileBrowser(ModalView):
         self.default_name = default_name
         self._stack = []
         self._items = []
+        self._visible_items = []
+        self._row_images = {}
+        self._thumbnail_cache = {}
+        self._thumbnail_inflight = set()
+        self._thumbnail_generation = 0
+        self._thumbnail_schedule = None
         self._busy = False
 
         root = BoxLayout(
@@ -105,6 +111,7 @@ class InternalFileBrowser(ModalView):
         self.rows = GridLayout(cols=1, spacing=dp(5), size_hint_y=None)
         self.rows.bind(minimum_height=self.rows.setter("height"))
         self.scroll.add_widget(self.rows)
+        self.scroll.bind(scroll_y=lambda *_: self._schedule_visible_thumbnails())
         root.add_widget(self.scroll)
 
         self.status_label = Label(
@@ -161,6 +168,7 @@ class InternalFileBrowser(ModalView):
         return button
 
     def _start(self):
+        self._thumbnail_generation += 1
         if self.storage.browser_root_available():
             self._stack = [(self.storage.get_root_document_id(), "Shared folder")]
             self._refresh()
@@ -195,9 +203,10 @@ class InternalFileBrowser(ModalView):
     def _refresh(self):
         if self._busy or not self._stack:
             return
+        self._thumbnail_generation += 1
         self._busy = True
         document_id, folder_name = self._stack[-1]
-        self.path_label.text = " / ".join(name for _, name in self._stack)
+        self.path_label.text = self.storage.get_document_display_path(document_id)
         self.up_button.disabled = len(self._stack) <= 1
         self.status_label.text = "Loading folder…"
 
@@ -229,12 +238,13 @@ class InternalFileBrowser(ModalView):
         if not hasattr(self, "rows"):
             return
         self.rows.clear_widgets()
+        self._row_images = {}
         query = self.search.text.strip().casefold()
-        visible = [
+        self._visible_items = [
             item for item in self._items
             if not query or query in item["name"].casefold()
         ]
-        if not visible:
+        if not self._visible_items:
             label = Label(
                 text="No matching items",
                 color=MUTED,
@@ -243,15 +253,42 @@ class InternalFileBrowser(ModalView):
             )
             self.rows.add_widget(label)
             return
-        for item in visible:
-            prefix = "📁  " if item["is_dir"] else "▧  "
-            text = prefix + item["name"]
-            if item["is_dir"]:
-                text += "   ›"
-            button = Button(
-                text=text,
+
+        for item in self._visible_items:
+            row = BoxLayout(
+                orientation="horizontal",
                 size_hint_y=None,
-                height=dp(48),
+                height=dp(72),
+                spacing=dp(8),
+                padding=(dp(4), dp(4), dp(4), dp(4)),
+            )
+            is_image = (
+                not item["is_dir"]
+                and item["name"].lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
+            )
+            if item["is_dir"]:
+                leading = Label(
+                    text="📁", size_hint=(None, 1), width=dp(58),
+                    color=FG, font_size="24sp")
+            elif is_image:
+                leading = KivyImage(
+                    source=self._thumbnail_cache.get(item["document_id"], ""),
+                    size_hint=(None, None),
+                    size=(dp(62), dp(62)),
+                    allow_stretch=True,
+                    keep_ratio=True,
+                )
+                self._row_images[item["document_id"]] = leading
+            else:
+                leading = Label(
+                    text=(item["name"].rsplit(".", 1)[-1][:4].upper()
+                          if "." in item["name"] else "FILE"),
+                    size_hint=(None, 1), width=dp(58),
+                    color=MUTED, font_size="11sp")
+
+            button = Button(
+                text=item["name"] + ("   ›" if item["is_dir"] else ""),
+                size_hint=(1, 1),
                 background_normal="",
                 background_down="",
                 background_color=PANEL_ALT if item["is_dir"] else PANEL,
@@ -265,7 +302,71 @@ class InternalFileBrowser(ModalView):
                 size=lambda w, *_: setattr(w, "text_size", (w.width - dp(20), None))
             )
             button.bind(on_release=lambda _btn, value=item: self._activate(value))
-            self.rows.add_widget(button)
+            row.add_widget(leading)
+            row.add_widget(button)
+            self.rows.add_widget(row)
+
+        self._schedule_visible_thumbnails()
+
+    def _schedule_visible_thumbnails(self):
+        if self._thumbnail_schedule is not None:
+            self._thumbnail_schedule.cancel()
+        self._thumbnail_schedule = Clock.schedule_once(
+            lambda _dt: self._load_visible_thumbnails(), 0.12)
+
+    def _load_visible_thumbnails(self):
+        self._thumbnail_schedule = None
+        if not self._visible_items or self._busy:
+            return
+        row_height = dp(72)
+        max_offset = max(0, self.rows.height - self.scroll.height)
+        top_offset = (1.0 - self.scroll.scroll_y) * max_offset
+        first = max(0, int(top_offset / row_height) - 2)
+        visible_count = int(self.scroll.height / row_height) + 5
+        candidates = self._visible_items[first:first + visible_count]
+        needed = []
+        for item in candidates:
+            key = item["document_id"]
+            is_image = (
+                not item["is_dir"]
+                and item["name"].lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
+            )
+            if (is_image and key not in self._thumbnail_cache
+                    and key not in self._thumbnail_inflight):
+                self._thumbnail_inflight.add(key)
+                needed.append(item)
+        if not needed:
+            return
+
+        generation = self._thumbnail_generation
+
+        def worker():
+            for item in needed:
+                key = item["document_id"]
+                try:
+                    path = self.storage.create_browser_thumbnail(key)
+                    error = None
+                except Exception as exc:
+                    path = None
+                    error = str(exc)
+                Clock.schedule_once(
+                    lambda _dt, doc_id=key, thumb=path, message=error, gen=generation:
+                        self._thumbnail_ready(doc_id, thumb, message, gen),
+                    0,
+                )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _thumbnail_ready(self, document_id, path, error, generation):
+        self._thumbnail_inflight.discard(document_id)
+        if generation != self._thumbnail_generation:
+            return
+        if path:
+            self._thumbnail_cache[document_id] = path
+            widget = self._row_images.get(document_id)
+            if widget is not None:
+                widget.source = path
+
 
     def _activate(self, item):
         if item["is_dir"]:
