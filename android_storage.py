@@ -4,11 +4,13 @@ Selected Android documents/directories are copied into app-private staging
 folders so image algorithms can keep using normal filesystem paths. Results
 are then exported to the user-selected SAF destination.
 """
+import hashlib
 import io
 import json
 import mimetypes
 import os
 import tempfile
+from urllib.parse import unquote
 
 
 def _to_java_byte_values(data):
