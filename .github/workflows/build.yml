@@ -67,8 +67,11 @@ jobs:
           pip install --upgrade pip==24.3.1
           pip install buildozer==1.5.0 Cython==0.29.36
 
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
       - name: Validate Python syntax
-        run: python -m compileall -q main.py android_storage.py
+        run: python -m compileall -q main.py android_storage.py file_browser.py tests
 
       - name: Package source archive
         run: |
@@ -82,9 +85,122 @@ jobs:
           path: ${{ runner.temp }}/RadarTool-Android-Source.zip
           if-no-files-found: error
 
+      - name: Select Java 17 for Gradle and Buildozer
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x "$JAVA_HOME_17_X64/bin/java"
+          echo "JAVA_HOME=$JAVA_HOME_17_X64" >> "$GITHUB_ENV"
+          echo "$JAVA_HOME_17_X64/bin" >> "$GITHUB_PATH"
+          "$JAVA_HOME_17_X64/bin/java" -version
+
+      - name: Pin python-for-android host pip
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'pip==25.3' > "$RUNNER_TEMP/pip-constraints.txt"
+          export PIP_CONSTRAINT="$RUNNER_TEMP/pip-constraints.txt"
+          echo "PIP_CONSTRAINT=$RUNNER_TEMP/pip-constraints.txt" >> "$GITHUB_ENV"
+          test "$(cat "$PIP_CONSTRAINT")" = "pip==25.3"
+          echo "Constraint ready: $(cat "$PIP_CONSTRAINT")"
+
+      - name: Cache pycairo source from PyPI
+        shell: bash
+        timeout-minutes: 8
+        run: |
+          set -euo pipefail
+          # Initialise the pinned python-for-android checkout and its build paths.
+          buildozer android p4a -- --help >/dev/null 2>&1
+          CACHE_DIR=".buildozer/android/platform/build-arm64-v8a_armeabi-v7a_x86_64/packages/pycairo"
+          mkdir -p "$CACHE_DIR"
+          PYCAIRO_URL="$(python - <<'PY'
+          import json
+          import urllib.request
+
+          request = urllib.request.Request(
+              "https://pypi.org/pypi/pycairo/1.28.0/json",
+              headers={"User-Agent": "RadarTool-Android-Build/1.0"},
+          )
+          with urllib.request.urlopen(request, timeout=30) as response:
+              metadata = json.load(response)
+          sdists = [
+              item["url"] for item in metadata["urls"]
+              if item["packagetype"] == "sdist"
+              and item["filename"] == "pycairo-1.28.0.tar.gz"
+          ]
+          if len(sdists) != 1:
+              raise SystemExit(
+                  f"Expected one pycairo 1.28.0 sdist, found {len(sdists)}")
+          print(sdists[0])
+          PY
+          )"
+          ARCHIVE="$CACHE_DIR/pycairo-1.28.0.tar.gz"
+          curl --fail --location --retry 10 --retry-all-errors \
+            --retry-delay 3 --retry-max-time 300 \
+            "$PYCAIRO_URL" --output "$ARCHIVE"
+          tar -tzf "$ARCHIVE" >/dev/null
+          touch "$CACHE_DIR/.mark-pycairo-1.28.0.tar.gz"
+          test -s "$ARCHIVE"
+          echo "Cached verified pycairo source archive: $(du -h "$ARCHIVE" | cut -f1)"
+
       - name: Build APK with Buildozer
         run: |
           buildozer android debug
+
+      - name: Boot x86_64 Android emulator and smoke-test APK
+        shell: bash
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          SDK_ROOT="$HOME/.buildozer/android/platform/android-sdk"
+          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -name sdkmanager | sort | tail -n1)"
+          AVDMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -name avdmanager | sort | tail -n1)"
+          EMULATOR="$SDK_ROOT/emulator/emulator"
+          ADB="$SDK_ROOT/platform-tools/adb"
+          test -x "$SDKMANAGER"
+          test -x "$AVDMANAGER"
+          test -x "$EMULATOR"
+          test -x "$ADB"
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses >/dev/null
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" \
+            "emulator" "platform-tools" \
+            "system-images;android-33;google_apis;x86_64"
+          echo "no" | "$AVDMANAGER" create avd --force \
+            --name radar-x86-smoke \
+            --package "system-images;android-33;google_apis;x86_64" \
+            --device "pixel_2"
+          export ANDROID_HOME="$SDK_ROOT"
+          export ANDROID_SDK_ROOT="$SDK_ROOT"
+          export PATH="$SDK_ROOT/platform-tools:$SDK_ROOT/emulator:$PATH"
+          "$EMULATOR" -avd radar-x86-smoke -no-window -no-audio \
+            -no-boot-anim -gpu swiftshader_indirect -no-snapshot \
+            -no-metrics > "$RUNNER_TEMP/radar-emulator.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/radar-emulator.pid"
+          for attempt in $(seq 1 100); do
+            booted="$("$ADB" shell getprop sys.boot_completed 2>/dev/null | tr -d '\\r' || true)"
+            if [ "$booted" = "1" ]; then break; fi
+            sleep 3
+          done
+          test "$booted" = "1" || {
+            cat "$RUNNER_TEMP/radar-emulator.log"
+            echo "Android emulator did not finish booting."
+            exit 1
+          }
+          APK="$(find bin -maxdepth 1 -type f -name '*.apk' | head -n1)"
+          test -n "$APK"
+          echo "Installing $APK"
+          "$ADB" install -r "$APK"
+          "$ADB" shell am force-stop org.tenshorecords.radartool || true
+          "$ADB" shell am start -W -n \
+            org.tenshorecords.radartool/org.kivy.android.PythonActivity
+          sleep 25
+          "$ADB" shell pidof org.tenshorecords.radartool
+          "$ADB" logcat -d -t 4000 > "$RUNNER_TEMP/radar-logcat.txt"
+          if grep -E "FATAL EXCEPTION|Fatal signal [0-9]+|could not load.*\.so|UnsatisfiedLinkError" \
+              "$RUNNER_TEMP/radar-logcat.txt"; then
+            exit 1
+          fi
+          echo "APK installed and remained running on x86_64 emulator."
 
       - name: Upload APK
         uses: actions/upload-artifact@v4

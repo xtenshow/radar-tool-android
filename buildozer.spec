@@ -4,6 +4,7 @@ package.name = radartool
 package.domain = org.tenshorecords
 source.dir = .
 source.include_exts = py,png,jpg,kv,atlas,ttf
+source.exclude_dirs = tests,docs,.github
 version = 1.0.0
 
 requirements = python3,kivy==2.3.1,kivymd==2.0.0,pillow,plyer,pyjnius,materialyoucolor==3.0.3,materialshapes,pycairo,exceptiongroup,asyncgui,asynckivy,android
@@ -16,7 +17,7 @@ android.api = 33
 android.minapi = 26
 android.ndk = 25b
 android.accept_sdk_license = True
-android.archs = arm64-v8a
+android.archs = arm64-v8a,armeabi-v7a,x86_64
 p4a.branch = v2026.05.09
 
 [buildozer]

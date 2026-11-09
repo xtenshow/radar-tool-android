@@ -8,7 +8,7 @@ import struct
 import threading
 import colorsys
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 from kivy.clock import Clock, mainthread
 from kivy.graphics import Color, RoundedRectangle, Rectangle
@@ -36,6 +36,7 @@ from kivymd.uix.dialog import (
 
 from plyer import filechooser
 from android_storage import AndroidStorage
+from file_browser import InternalFileBrowser
 
 try:
     from android.permissions import request_permissions, Permission
@@ -123,7 +124,9 @@ def pick_file(on_pick, filters=None, app_ref=None):
             _picker_error(app_ref, "Android file access unavailable",
                           "The Android Storage Access Framework could not be initialized.")
             return
-        app_ref.storage.pick_file(on_pick, mime_type="image/*")
+        InternalFileBrowser(
+            app_ref, mode="file", callback=on_pick
+        ).open()
         return
 
     def cb(selection):
@@ -142,7 +145,11 @@ def pick_dir(on_pick, app_ref=None, output=False):
             _picker_error(app_ref, "Android folder access unavailable",
                           "The Android Storage Access Framework could not be initialized.")
             return
-        app_ref.storage.pick_directory(output=output, callback=on_pick)
+        InternalFileBrowser(
+            app_ref,
+            mode="output_dir" if output else "input_dir",
+            callback=on_pick,
+        ).open()
         return
 
     def cb(selection):
@@ -161,7 +168,12 @@ def pick_save_file(on_pick, app_ref=None, default_name="recolored.png"):
             _picker_error(app_ref, "Android save unavailable",
                           "The Android Storage Access Framework could not be initialized.")
             return
-        app_ref.storage.pick_save_file(on_pick, default_name=default_name)
+        InternalFileBrowser(
+            app_ref,
+            mode="save_file",
+            callback=on_pick,
+            default_name=default_name,
+        ).open()
         return
 
     def cb(selection):
@@ -383,7 +395,10 @@ class BaseToolItem(Screen):
         card = self._card()
         card.add_widget(self._label(title, color=FG, size=14,
                                     bold=True, height=dp(24)))
-        path_lbl = self._label(hint, color=FG_MUTED, size=11, height=dp(20))
+        path_lbl = self._label(hint, color=FG_MUTED, size=11, height=dp(34))
+        path_lbl.halign = "left"
+        path_lbl.valign = "middle"
+        path_lbl.bind(size=lambda w, *_: setattr(w, "text_size", (w.width, None)))
         card.add_widget(path_lbl)
         btn = MDButton(MDButtonText(text="Browse"), style="tonal",
                        size_hint_y=None, height=dp(42))
@@ -488,12 +503,12 @@ class MergeItem(BaseToolItem):
 
     def _on_input(self, path):
         self.input_folder = path
-        self.input_label.text = truncate_path(path)
+        self.input_label.text = self.app_ref.display_path(path)
         self.input_label.text_color = hex_rgba(PRIMARY)
 
     def _on_output(self, path):
         self.output_folder = path
-        self.output_label.text = truncate_path(path)
+        self.output_label.text = self.app_ref.display_path(path)
         self.output_label.text_color = hex_rgba(PRIMARY)
 
     def _do_merge(self):
@@ -547,6 +562,8 @@ class MergeItem(BaseToolItem):
                 if i % 12 == 0:
                     self._update_progress(found / TOTAL_TILES)
             canvas.save(os.path.join(out_dir, "map.png"))
+            if self.app_ref.storage is not None:
+                self.app_ref.storage.export_directory_if_needed(out_dir)
             self._done(found, tw, th)
         except Exception as e:
             self._fail(str(e))
@@ -557,17 +574,10 @@ class MergeItem(BaseToolItem):
 
     @mainthread
     def _done(self, found, tw, th):
-        try:
-            if self.app_ref.storage is not None:
-                self.app_ref.storage.export_directory_if_needed(self.output_folder)
-        except Exception as exc:
-            self.progress.value = 0
-            self.app_ref.set_status("Export failed", RED)
-            self.app_ref.show_dialog(
-                "Export failed",
-                f"map.png was generated in app storage, but could not be exported:\n{exc}")
-            return
         self.progress.value = 100
+        self.app_ref.record_operation(
+            "Merge", self.input_folder, self.output_folder,
+            f"{found} tiles -> map.png ({tw * GRID_SIZE}x{th * GRID_SIZE})")
         self.app_ref.set_status(f"Merged {found} tiles -> map.png", GREEN)
         self.app_ref.show_dialog(
             "Done",
@@ -655,12 +665,12 @@ class SplitItem(BaseToolItem):
 
     def _on_image(self, path):
         self.image_path = path
-        self.image_label.text = truncate_path(path)
+        self.image_label.text = self.app_ref.display_path(path)
         self.image_label.text_color = hex_rgba(PRIMARY)
 
     def _on_output(self, path):
         self.output_folder = path
-        self.output_label.text = truncate_path(path)
+        self.output_label.text = self.app_ref.display_path(path)
         self.output_label.text_color = hex_rgba(PRIMARY)
 
     def _do_split(self):
@@ -695,6 +705,8 @@ class SplitItem(BaseToolItem):
                     os.path.join(out_dir, f"radar{i:02}.png"))
                 if i % 12 == 0:
                     self._update_progress((i + 1) / TOTAL_TILES)
+            if self.app_ref.storage is not None:
+                self.app_ref.storage.export_directory_if_needed(out_dir)
             self._done(tw, th)
         except Exception as e:
             self._fail(str(e))
@@ -705,17 +717,10 @@ class SplitItem(BaseToolItem):
 
     @mainthread
     def _done(self, tw, th):
-        try:
-            if self.app_ref.storage is not None:
-                self.app_ref.storage.export_directory_if_needed(self.output_folder)
-        except Exception as exc:
-            self.progress.value = 0
-            self.app_ref.set_status("Export failed", RED)
-            self.app_ref.show_dialog(
-                "Export failed",
-                f"Tiles were generated in app storage, but could not be exported:\n{exc}")
-            return
         self.progress.value = 100
+        self.app_ref.record_operation(
+            "Split", self.image_path, self.output_folder,
+            f"144 tiles at {tw}x{th}")
         self.app_ref.set_status("Exported 144 tiles", GREEN)
         self.app_ref.show_dialog(
             "Done",
@@ -784,12 +789,12 @@ class TxDItem(BaseToolItem):
 
     def _on_input(self, path):
         self.input_folder = path
-        self.input_label.text = truncate_path(path)
+        self.input_label.text = self.app_ref.display_path(path)
         self.input_label.text_color = hex_rgba(PRIMARY)
 
     def _on_output(self, path):
         self.output_folder = path
-        self.output_label.text = truncate_path(path)
+        self.output_label.text = self.app_ref.display_path(path)
         self.output_label.text_color = hex_rgba(PRIMARY)
 
     def _do_convert(self):
@@ -824,6 +829,8 @@ class TxDItem(BaseToolItem):
                 except Exception as e:
                     errors.append(f"{f}: {e}")
                 self._update_progress((idx + 1) / len(files))
+            if self.app_ref.storage is not None:
+                self.app_ref.storage.export_directory_if_needed(self.output_folder)
             self._done(ok, len(errors), errors)
         except Exception as e:
             self._fail(str(e))
@@ -834,17 +841,10 @@ class TxDItem(BaseToolItem):
 
     @mainthread
     def _done(self, ok, err_count, errors):
-        try:
-            if self.app_ref.storage is not None:
-                self.app_ref.storage.export_directory_if_needed(self.output_folder)
-        except Exception as exc:
-            self.progress.value = 0
-            self.app_ref.set_status("Export failed", RED)
-            self.app_ref.show_dialog(
-                "Export failed",
-                f"TXD files were generated in app storage, but could not be exported:\n{exc}")
-            return
         self.progress.value = 100
+        self.app_ref.record_operation(
+            "TXD", self.input_folder, self.output_folder,
+            f"{ok} converted, {err_count} failed")
         if err_count:
             self.app_ref.set_status(
                 f"{ok} converted, {err_count} failed", RED)
@@ -879,6 +879,8 @@ class ColorItem(BaseToolItem):
         self.replace_rgb = (255, 0, 0)
         self.tolerance = 40
         self._preview_event = None
+        self._image_load_generation = 0
+        self._preview_generation = 0
         self._build()
 
     def _build(self):
@@ -897,7 +899,11 @@ class ColorItem(BaseToolItem):
                                         bold=True, height=dp(24)))
         self._img_path_label = self._label("No image loaded",
                                            color=FG_MUTED, size=11,
-                                           height=dp(20))
+                                           height=dp(34))
+        self._img_path_label.halign = "left"
+        self._img_path_label.valign = "middle"
+        self._img_path_label.bind(
+            size=lambda w, *_: setattr(w, "text_size", (w.width, None)))
         img_card.add_widget(self._img_path_label)
         b = MDButton(MDButtonText(text="Browse Image"), style="tonal",
                      size_hint_y=None, height=dp(42))
@@ -1001,26 +1007,51 @@ class ColorItem(BaseToolItem):
                   app_ref=self.app_ref)
 
     def _on_image(self, path):
+        # Decoding and thumbnail generation can be expensive for large radar
+        # maps. Keep both off the Kivy UI thread.
+        self._image_load_generation += 1
+        generation = self._image_load_generation
         self.app_ref.set_status("Loading image...", YELLOW)
-        try:
-            self.image_path = path
-            self.pil_image = Image.open(path).convert("RGBA")
-            self._img_path_label.text = truncate_path(path)
-            self._img_path_label.text_color = hex_rgba(PRIMARY)
 
-            preview = self.pil_image.copy()
-            preview.thumbnail((400, 400), Image.LANCZOS)
-            self.preview_src = preview
-            self._orig_image.texture = pil_to_texture(preview)
+        def worker():
+            try:
+                with Image.open(path) as source:
+                    full_image = ImageOps.exif_transpose(source).convert("RGBA")
+                preview = full_image.copy()
+                preview.thumbnail((512, 512), Image.LANCZOS)
+                error = None
+            except Exception as exc:
+                full_image = None
+                preview = None
+                error = str(exc)
 
-            # initial live preview with current settings
-            self._schedule_preview()
-            self.app_ref.set_status(
-                f"Loaded {os.path.basename(path)}", GREEN)
-        except Exception as exc:
+            Clock.schedule_once(
+                lambda _dt: self._finish_image_load(
+                    path, full_image, preview, error, generation),
+                0,
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_image_load(self, path, full_image, preview, error, generation):
+        if generation != self._image_load_generation:
+            return
+        if error:
             self.app_ref.set_status("Load failed", RED)
-            self.app_ref.show_dialog(
-                "Error", f"Could not open image:\n{exc}")
+            self.app_ref.show_dialog("Error", f"Could not open image:\n{error}")
+            return
+
+        self.image_path = path
+        self.pil_image = full_image
+        self.preview_src = preview
+        self._img_path_label.text = self.app_ref.display_path(path)
+        self._img_path_label.text_color = hex_rgba(PRIMARY)
+        self._orig_image.texture = pil_to_texture(preview)
+        self._schedule_preview()
+        self.app_ref.set_status(
+            f"Loaded {os.path.basename(path)} ({full_image.width}x{full_image.height})",
+            GREEN,
+        )
 
     def _tap_original(self, instance, touch):
         if self.preview_src is None:
@@ -1193,19 +1224,41 @@ class ColorItem(BaseToolItem):
     def _schedule_preview(self):
         if self._preview_event is not None:
             self._preview_event.cancel()
-        self._preview_event = Clock.schedule_once(self._update_preview, 0.2)
+        self._preview_generation += 1
+        generation = self._preview_generation
+        self._preview_event = Clock.schedule_once(
+            lambda dt: self._start_preview(generation), 0.16)
 
-    @mainthread
-    def _update_preview(self, dt):
+    def _start_preview(self, generation):
         self._preview_event = None
         if self.preview_src is None:
             return
-        try:
-            result = recolor_image(self.preview_src, self.target_rgb,
-                                   self.replace_rgb, self.tolerance)
-            self._live_image.texture = pil_to_texture(result)
-        except Exception:
-            pass
+
+        # Snapshot inputs so a worker never reads mutable UI state.
+        source = self.preview_src.copy()
+        target_rgb = tuple(self.target_rgb)
+        replace_rgb = tuple(self.replace_rgb)
+        tolerance = int(self.tolerance)
+
+        def worker():
+            try:
+                result = recolor_image(
+                    source, target_rgb, replace_rgb, tolerance)
+                Clock.schedule_once(
+                    lambda _dt: self._apply_preview(result, generation), 0)
+            except Exception as exc:
+                message = str(exc)[:100]
+                Clock.schedule_once(
+                    lambda _dt, text=message: self.app_ref.set_status(
+                        f"Preview failed: {text}", RED), 0)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_preview(self, result, generation):
+        # Discard stale results from earlier slider movements or image loads.
+        if generation != self._preview_generation or self.preview_src is None:
+            return
+        self._live_image.texture = pil_to_texture(result)
 
     # -- save ----------------------------------------------------------
     def _save(self):
@@ -1230,23 +1283,18 @@ class ColorItem(BaseToolItem):
             result = recolor_image(self.pil_image, self.target_rgb,
                                    self.replace_rgb, self.tolerance)
             result.save(out_path)
-            self._save_done(out_path)
+            filename = os.path.basename(out_path)
+            if self.app_ref.storage is not None:
+                filename = self.app_ref.storage.export_file_if_needed(out_path)
+            self._save_done(filename)
         except Exception as exc:
             self._save_fail(str(exc))
 
     @mainthread
-    def _save_done(self, path):
-        try:
-            filename = os.path.basename(path)
-            if self.app_ref.storage is not None:
-                filename = self.app_ref.storage.export_file_if_needed(path)
-        except Exception as exc:
-            self.app_ref.set_status("Export failed", RED)
-            self.app_ref.show_dialog(
-                "Export failed",
-                f"The image was created in app storage, but export failed:\n{exc}")
-            return
-
+    def _save_done(self, filename, output_path):
+        self.app_ref.record_operation(
+            "Color", self.image_path, output_path,
+            f"Saved {filename}; target={self.target_rgb}; replacement={self.replace_rgb}; tolerance={self.tolerance}")
         self.app_ref.set_status(f"Saved -> {filename}", GREEN)
         self.app_ref.show_dialog(
             "Done", f"Color replaced and saved!\n{filename}")
@@ -1255,6 +1303,85 @@ class ColorItem(BaseToolItem):
     def _save_fail(self, msg):
         self.app_ref.set_status("Save failed", RED)
         self.app_ref.show_dialog("Error", msg)
+
+
+
+# ============================================================================
+#  OPERATION HISTORY
+# ============================================================================
+class HistoryItem(BaseToolItem):
+    def __init__(self, app_ref, **kw):
+        super().__init__(app_ref, name="history", text="History",
+                         icon="history", **kw)
+        self._build()
+
+    def _build(self):
+        content = self._make_content_root()
+        content.add_widget(self._header(
+            "Operation History",
+            "Recent successful Split, Merge, TXD and Color jobs"))
+
+        toolbar = MDBoxLayout(
+            orientation="horizontal", size_hint_y=None, height=dp(42),
+            padding=(dp(16), 0, dp(16), 0))
+        toolbar.add_widget(Widget())
+        refresh = MDButton(
+            MDButtonText(text="Refresh"),
+            style="tonal",
+            size_hint_x=None, width=dp(104),
+            size_hint_y=None, height=dp(38))
+        refresh.bind(on_release=lambda *_: self.refresh())
+        toolbar.add_widget(refresh)
+        content.add_widget(toolbar)
+
+        self.scroll = ScrollView()
+        self.records_box = MDBoxLayout(
+            orientation="vertical", size_hint_y=None,
+            spacing=dp(10), padding=(dp(16), dp(8), dp(16), dp(16)))
+        self.records_box.bind(minimum_height=self.records_box.setter("height"))
+        self.scroll.add_widget(self.records_box)
+        content.add_widget(self.scroll)
+        self.add_widget(content)
+        self.bind(on_pre_enter=lambda *_: self.refresh())
+
+    def refresh(self):
+        self.records_box.clear_widgets()
+        records = self.app_ref.history.list_records()
+        if not records:
+            empty = self._card()
+            empty.add_widget(self._label(
+                "No operations yet", color=FG, size=15, bold=True,
+                height=dp(28)))
+            empty.add_widget(self._label(
+                "Completed operations will appear here and remain after you close the app.",
+                color=FG_DIM, size=12, height=dp(42)))
+            self.records_box.add_widget(empty)
+            return
+
+        for record in records:
+            card = self._card()
+            timestamp = record.get("timestamp", "")
+            try:
+                from datetime import datetime
+                parsed = datetime.fromisoformat(timestamp)
+                date_text = parsed.astimezone().strftime("%Y-%m-%d  %H:%M")
+            except Exception:
+                date_text = timestamp
+            title = f'{record.get("operation", "Operation")}  •  {date_text}'
+            card.add_widget(self._label(
+                title, color=PRIMARY_HOVER, size=13, bold=True,
+                height=dp(26)))
+            card.add_widget(self._label(
+                "Input: " + (record.get("input") or "—"),
+                color=FG_DIM, size=11, height=dp(34)))
+            card.add_widget(self._label(
+                "Output: " + (record.get("output") or "—"),
+                color=FG_DIM, size=11, height=dp(34)))
+            details = record.get("details", "")
+            if details:
+                card.add_widget(self._label(
+                    details, color=FG, size=12, height=dp(28)))
+            self.records_box.add_widget(card)
 
 
 # ============================================================================
@@ -1269,6 +1396,7 @@ class RadarApp(MDApp):
 
         self.storage = None
         self._storage_init_error = None
+        self.history = OperationHistory(self.user_data_dir)
         if ANDROID:
             try:
                 self.storage = AndroidStorage(self)
@@ -1283,9 +1411,11 @@ class RadarApp(MDApp):
         self.split_tab = SplitItem(self)
         self.txd_tab = TxDItem(self)
         self.color_tab = ColorItem(self)
+        self.history_tab = HistoryItem(self)
 
         screen_manager = ScreenManager()
-        for screen in (self.merge_tab, self.split_tab, self.txd_tab, self.color_tab):
+        for screen in (self.merge_tab, self.split_tab, self.txd_tab,
+                       self.color_tab, self.history_tab):
             screen_manager.add_widget(screen)
         screen_manager.current = self.merge_tab.name
         root.add_widget(screen_manager)
@@ -1298,7 +1428,8 @@ class RadarApp(MDApp):
             padding=(dp(4), 0, dp(4), 0),
             md_bg_color=hex_rgba(BG_SIDEBAR),
         )
-        for screen in (self.merge_tab, self.split_tab, self.txd_tab, self.color_tab):
+        for screen in (self.merge_tab, self.split_tab, self.txd_tab,
+                       self.color_tab, self.history_tab):
             button = MDButton(
                 MDButtonText(text=screen.tab_text),
                 style="text",
@@ -1349,6 +1480,50 @@ class RadarApp(MDApp):
                 0.2)
 
         return root
+
+    def on_start(self):
+        # Hide only Android's system navigation controls. Keep the status bar
+        # visible and let Android reveal the navigation bar transiently on swipe.
+        Clock.schedule_once(lambda _dt: self._apply_immersive_navigation(), 0.35)
+
+    def on_resume(self):
+        # Activities such as document providers can restore system UI flags
+        # when they return control to the app.
+        Clock.schedule_once(lambda _dt: self._apply_immersive_navigation(), 0.25)
+
+    def _apply_immersive_navigation(self):
+        if not ANDROID:
+            return
+        try:
+            from jnius import autoclass
+            activity = autoclass("org.kivy.android.PythonActivity").mActivity
+            view = autoclass("android.view.View")
+            flags = (
+                view.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                | view.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                | view.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                | view.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+            )
+            activity.getWindow().getDecorView().setSystemUiVisibility(flags)
+        except Exception as exc:
+            # Do not crash startup if a vendor ROM does not accept the flags.
+            self.set_status("System navigation could not be hidden", YELLOW)
+            print("Immersive navigation setup failed:", exc)
+
+    def display_path(self, path):
+        if self.storage is not None:
+            return self.storage.get_display_path(path)
+        return str(path or "").replace(os.sep, "/")
+
+    def record_operation(self, operation, input_path, output_path, details=""):
+        try:
+            source = self.display_path(input_path) if input_path else ""
+            destination = self.display_path(output_path) if output_path else ""
+            self.history.record(operation, source, destination, details)
+            if hasattr(self, "history_tab"):
+                Clock.schedule_once(lambda _dt: self.history_tab.refresh(), 0)
+        except Exception as exc:
+            print("Could not save operation history:", exc)
 
     def set_status(self, text, color=GREEN):
         self._status_label.text = text
